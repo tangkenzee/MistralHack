@@ -7,7 +7,7 @@ from mistralai import Mistral
 load_dotenv()
 
 api_key = os.environ["MISTRAL_API_KEY"]
-model = "pixtral-large-latest"
+model = "mistral-ocr-latest"
 
 client = Mistral(api_key=api_key)
 
