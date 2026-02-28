@@ -67,7 +67,7 @@ const Index = () => {
 
             <button
               onClick={() => navigate("/find-account")}
-              className="w-full mt-3 text-primary text-sm hover:underline"
+              className="w-full mt-3 py-3 rounded-lg border border-primary text-primary font-semibold text-base hover:bg-secondary transition-colors"
             >
               Forgotten password?
             </button>

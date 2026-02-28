@@ -21,7 +21,7 @@ const FindAccount = () => {
             placeholder="Mobile number or email address"
             value={identifier}
             onChange={(e) => setIdentifier(e.target.value)}
-            className="w-full px-4 py-3.5 border border-border rounded-lg text-base bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+            className="w-full px-4 py-3.5 border-2 border-gray-500 rounded-lg text-base bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
           />
           <button
             onClick={() => navigate("/choose-login")}

@@ -31,7 +31,7 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 
 # ── Model Configuration ──────────────────────────────────────────────────────
 #  Centralised config for the Mistral API calls.
-#    • temperature : low (0.2) for deterministic, reliable UI-navigation answers
+#    • temperature : low (0.1) for deterministic, reliable UI-navigation answers
 #    • response_format : force the model to return valid JSON natively
 MODEL_CONFIG = {
     "model": "mistral-small-latest",
@@ -118,6 +118,23 @@ def _check_api_key() -> bool:
     return True
 
 
+# ── Core Mistral Call (shared by one-shot & session modes) ────────────────────
+
+def _call_mistral(messages: list[dict]) -> str:
+    """Send a full messages list to Mistral and return the raw response text.
+
+    This is the single point of contact with the Mistral API, used by both
+    the one-shot functions (label_elements / find_target_box) and by the
+    multi-step Session class.
+    """
+    if not _check_api_key():
+        return ""
+
+    client = Mistral(api_key=MISTRAL_API_KEY)
+    response = client.chat.complete(**MODEL_CONFIG, messages=messages)
+    return response.choices[0].message.content.strip()
+
+
 # ── Public Functions ──────────────────────────────────────────────────────────
 
 def label_elements(marked_image_path: str) -> list:
@@ -130,33 +147,29 @@ def label_elements(marked_image_path: str) -> list:
     """
     print("[BRAIN] Sending annotated image to Mistral AI for labeling …")
 
-    if not _check_api_key():
-        return []
-
-    client = Mistral(api_key=MISTRAL_API_KEY)
     image_b64 = _encode_image_base64(marked_image_path)
 
-    response = client.chat.complete(
-        **MODEL_CONFIG,
-        messages=[
-            {"role": "system", "content": LABEL_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": f"data:image/png;base64,{image_b64}",
-                    },
-                    {
-                        "type": "text",
-                        "text": "Analyse every numbered red box in this screenshot. List each element.",
-                    },
-                ],
-            },
-        ],
-    )
+    messages = [
+        {"role": "system", "content": LABEL_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": f"data:image/png;base64,{image_b64}",
+                },
+                {
+                    "type": "text",
+                    "text": "Analyse every numbered red box in this screenshot. List each element.",
+                },
+            ],
+        },
+    ]
 
-    raw = response.choices[0].message.content.strip()
+    raw = _call_mistral(messages)
+    if not raw:
+        return []
+
     print(f"  ✔ Mistral responded ({len(raw)} chars)")
 
     labels = _parse_json(raw)
@@ -168,10 +181,14 @@ def label_elements(marked_image_path: str) -> list:
     return labels
 
 
-def find_target_box(marked_image_path: str, user_prompt: str) -> dict:
+def find_target_box(marked_image_path: str, user_prompt: str, raw_image_path: str | None = None) -> dict:
     """
     Send the annotated image + user prompt to Mistral and get back the
     single box ID the user should interact with (navigation mode).
+
+    If raw_image_path is provided, both the raw (clean UI) and marked
+    (annotated with box IDs) images are sent so the model can cross-reference
+    the actual element appearance with the numbered IDs.
 
     Returns a dict:
       { "box_id": 14, "message": "Click the 'Forgot Password' link …" }
@@ -181,33 +198,39 @@ def find_target_box(marked_image_path: str, user_prompt: str) -> dict:
     """
     print("[BRAIN] Asking Mistral AI which element to click …")
 
-    if not _check_api_key():
+    marked_b64 = _encode_image_base64(marked_image_path)
+
+    # Build image content: raw first (if available), then marked
+    image_parts = []
+    if raw_image_path:
+        raw_b64 = _encode_image_base64(raw_image_path)
+        image_parts.append({
+            "type": "image_url",
+            "image_url": f"data:image/png;base64,{raw_b64}",
+        })
+    image_parts.append({
+        "type": "image_url",
+        "image_url": f"data:image/png;base64,{marked_b64}",
+    })
+
+    messages = [
+        {"role": "system", "content": TARGET_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                *image_parts,
+                {
+                    "type": "text",
+                    "text": f"The user wants to: {user_prompt}",
+                },
+            ],
+        },
+    ]
+
+    raw = _call_mistral(messages)
+    if not raw:
         return {"box_id": None, "message": "API key not configured."}
 
-    client = Mistral(api_key=MISTRAL_API_KEY)
-    image_b64 = _encode_image_base64(marked_image_path)
-
-    response = client.chat.complete(
-        **MODEL_CONFIG,
-        messages=[
-            {"role": "system", "content": TARGET_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": f"data:image/png;base64,{image_b64}",
-                    },
-                    {
-                        "type": "text",
-                        "text": f"The user wants to: {user_prompt}",
-                    },
-                ],
-            },
-        ],
-    )
-
-    raw = response.choices[0].message.content.strip()
     print(f"  ✔ Mistral responded ({len(raw)} chars)")
 
     result = _parse_json(raw)
@@ -217,3 +240,4 @@ def find_target_box(marked_image_path: str, user_prompt: str) -> dict:
         return {"box_id": None, "message": "Failed to parse AI response."}
 
     return result
+

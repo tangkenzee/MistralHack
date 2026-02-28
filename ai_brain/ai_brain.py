@@ -16,6 +16,7 @@ Pipeline:
 import os
 from ai_brain.opencv_detect import detect_elements
 from ai_brain.mistral_label import find_target_box, label_elements
+from ai_brain.session import Session
 
 # ── Images output directory (project root / images) ──────────────────────────
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
