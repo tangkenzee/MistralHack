@@ -13,6 +13,7 @@ Architecture:
 """
 
 import sys
+import math
 import signal
 from pathlib import Path
 import mss
@@ -87,6 +88,8 @@ CARD_W            = 340    # response card width
 CARD_MIN_H        = 320    # response card height (taller for message history)
 CARD_MARGIN       = 16     # gap between card edge and screen edge
 CARD_DODGE_PAD    = 60     # proximity threshold to start dodging cursor
+CARD_DODGE_DIST   = 400    # how far the card flies when dodging
+CARD_STUCK_THRESH = 20     # min px movement; below this we try deflecting
 # Modern Apple-like sans-serif; Qt falls back gracefully if unavailable
 FONT_FAMILY       = "Segoe UI Variable"
 
@@ -547,13 +550,12 @@ class ResponseCard(QWidget):
 
     # -- Positioning -----------------------------------------------------------
     def _setup_positions(self):
-        """Precompute left / right resting positions (vertically centred)."""
+        """Store screen bounds and place card at bottom-right."""
         screen = QApplication.primaryScreen().geometry()
-        self._card_y = (screen.height() - CARD_MIN_H) // 2
-        self._pos_right = QPoint(screen.width() - CARD_W - CARD_MARGIN, self._card_y)
-        self._pos_left  = QPoint(CARD_MARGIN, self._card_y)
-        self._on_right = True      # start on the right
-        self.move(self._pos_right)
+        self._screen = screen
+        start = QPoint(screen.width() - CARD_W - CARD_MARGIN,
+                       screen.height() - CARD_MIN_H - CARD_MARGIN)
+        self.move(start)
 
         self._anim = QPropertyAnimation(self, b"pos")
         self._anim.setDuration(350)
@@ -562,28 +564,63 @@ class ResponseCard(QWidget):
     # -- Cursor dodge timer ----------------------------------------------------
     def _start_dodge_timer(self):
         self._dodge_timer = QTimer(self)
-        self._dodge_timer.setInterval(120)   # check ~8 times/sec
+        self._dodge_timer.setInterval(100)   # check ~10 times/sec
         self._dodge_timer.timeout.connect(self._check_cursor)
         self._dodge_timer.start()
 
     def _check_cursor(self):
-        """If the cursor is within the padded card rect, slide to the other side."""
+        """If the cursor is near the card, push the card away in 2D."""
         if self._anim.state() == QPropertyAnimation.State.Running:
-            return  # don't interrupt an ongoing slide
+            return
 
         cursor = QCursor.pos()
         geo = self.geometry()
         padded = geo.adjusted(-CARD_DODGE_PAD, -CARD_DODGE_PAD,
                               CARD_DODGE_PAD, CARD_DODGE_PAD)
 
-        if padded.contains(cursor):
-            # Dodge to the opposite side
-            if self._on_right:
-                self._slide_to(self._pos_left)
-                self._on_right = False
-            else:
-                self._slide_to(self._pos_right)
-                self._on_right = True
+        if not padded.contains(cursor):
+            return
+
+        # Vector from cursor → card centre (push card *away* from cursor)
+        cx, cy = geo.center().x(), geo.center().y()
+        dx = cx - cursor.x()
+        dy = cy - cursor.y()
+        length = (dx * dx + dy * dy) ** 0.5 or 1.0
+        ux, uy = dx / length, dy / length       # unit direction
+
+        target = self._dodge_target(ux, uy, cx, cy)
+
+        # If the card would barely move (stuck against wall/corner), deflect
+        if target is None:
+            for angle_deg in (45, -45, 90, -90, 135, -135, 180):
+                rad = math.radians(angle_deg)
+                cos_a, sin_a = math.cos(rad), math.sin(rad)
+                rx = ux * cos_a - uy * sin_a
+                ry = ux * sin_a + uy * cos_a
+                target = self._dodge_target(rx, ry, cx, cy)
+                if target is not None:
+                    break
+
+        if target is not None:
+            self._slide_to(target)
+
+    # -- Dodge helpers ---------------------------------------------------------
+    def _dodge_target(self, ux, uy, cx, cy):
+        """Return a QPoint dodge destination for unit vector (ux, uy) from
+        card-centre (cx, cy), or *None* if the move is too small (stuck)."""
+        tx = int(cx + ux * CARD_DODGE_DIST - CARD_W / 2)
+        ty = int(cy + uy * CARD_DODGE_DIST - CARD_MIN_H / 2)
+
+        max_x = self._screen.width()  - CARD_W      - CARD_MARGIN
+        max_y = self._screen.height() - CARD_MIN_H  - CARD_MARGIN
+        tx = max(CARD_MARGIN, min(tx, max_x))
+        ty = max(CARD_MARGIN, min(ty, max_y))
+
+        move_dx = tx - self.pos().x()
+        move_dy = ty - self.pos().y()
+        if (move_dx * move_dx + move_dy * move_dy) ** 0.5 < CARD_STUCK_THRESH:
+            return None
+        return QPoint(tx, ty)
 
     def _slide_to(self, target: QPoint):
         self._anim.stop()

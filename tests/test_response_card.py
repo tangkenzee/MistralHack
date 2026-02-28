@@ -1,18 +1,18 @@
 """
 tests/test_response_card.py
 ============================
-Tests for ResponseCard (aliased as ChatPanel) -- cursor-dodging reply card.
+Tests for ResponseCard (aliased as ChatPanel) -- 2D cursor-dodging reply card.
 
 Requires pytest-qt (qtbot fixture).
 """
 
 import pytest
-from unittest.mock import patch, PropertyMock
+from unittest.mock import patch
 from PyQt6.QtCore import Qt, QPoint
 
 from overlay_ui import (
     ResponseCard, ChatPanel, CARD_W, CARD_MIN_H,
-    CARD_MARGIN, CARD_DODGE_PAD,
+    CARD_MARGIN, CARD_DODGE_PAD, CARD_DODGE_DIST, CARD_STUCK_THRESH,
 )
 
 
@@ -51,66 +51,128 @@ class TestConstruction:
     def test_status_label_starts_ready(self, card):
         assert card.status_label.text() == "Ready"
 
-    def test_starts_on_right(self, card):
-        assert card._on_right is True
-
-
-# -- Dodge positions -----------------------------------------------------------
-
-class TestDodgePositions:
-    def test_pos_right_x(self, card):
-        from PyQt6.QtWidgets import QApplication
-        sw = QApplication.primaryScreen().geometry().width()
-        assert card._pos_right.x() == sw - CARD_W - CARD_MARGIN
-
-    def test_pos_left_x(self, card):
-        assert card._pos_left.x() == CARD_MARGIN
-
-    def test_initial_position_is_right(self, card):
-        assert card.pos() == card._pos_right
-
-    def test_slide_to_left(self, card):
-        card._slide_to(card._pos_left)
-        assert card._anim.endValue() == card._pos_left
-
-    def test_slide_to_right(self, card):
-        card._slide_to(card._pos_right)
-        assert card._anim.endValue() == card._pos_right
-
-
-# -- Cursor dodging logic ------------------------------------------------------
-
-class TestCursorDodge:
-    def test_dodge_flips_to_left_when_cursor_near_right(self, card):
-        """When cursor is inside padded rect and card is on right, dodge left."""
-        card._on_right = True
-        card.move(card._pos_right)
-        # Simulate cursor at card centre
-        centre = card.geometry().center()
-        with patch("overlay_ui.QCursor.pos", return_value=centre):
-            card._check_cursor()
-        assert card._on_right is False
-        assert card._anim.endValue() == card._pos_left
-
-    def test_dodge_flips_to_right_when_cursor_near_left(self, card):
-        card._on_right = False
-        card.move(card._pos_left)
-        centre = card.geometry().center()
-        with patch("overlay_ui.QCursor.pos", return_value=centre):
-            card._check_cursor()
-        assert card._on_right is True
-        assert card._anim.endValue() == card._pos_right
-
-    def test_no_dodge_when_cursor_far_away(self, card):
-        card._on_right = True
-        card.move(card._pos_right)
-        far = QPoint(0, 0)
-        with patch("overlay_ui.QCursor.pos", return_value=far):
-            card._check_cursor()
-        assert card._on_right is True  # unchanged
+    def test_screen_rect_stored(self, card):
+        assert card._screen is not None
 
     def test_timer_is_running(self, card):
         assert card._dodge_timer.isActive()
+
+
+# -- 2D Cursor dodging --------------------------------------------------------
+
+class TestCursorDodge:
+    def test_no_dodge_when_cursor_far_away(self, card):
+        """Card should not move when cursor is far from it."""
+        original = card.pos()
+        far = QPoint(0, 0)
+        with patch("overlay_ui.QCursor.pos", return_value=far):
+            card._check_cursor()
+        assert card.pos() == original
+
+    def test_dodge_away_from_cursor_on_left(self, card):
+        """When cursor approaches from the left, card should move rightward."""
+        # Centre the card so it has room to dodge right
+        card.move(card._screen.width() // 2, card._screen.height() // 2)
+        geo = card.geometry()
+        left_edge = QPoint(geo.left() - CARD_DODGE_PAD + 5, geo.center().y())
+        with patch("overlay_ui.QCursor.pos", return_value=left_edge):
+            card._check_cursor()
+        assert card._anim.endValue().x() > geo.x()
+
+    def test_dodge_away_from_cursor_on_right(self, card):
+        """When cursor approaches from the right, card should move leftward."""
+        # Place card in centre so it has room to dodge left
+        card.move(card._screen.width() // 2, card._screen.height() // 2)
+        geo = card.geometry()
+        right_edge = QPoint(geo.right() + CARD_DODGE_PAD - 5, geo.center().y())
+        with patch("overlay_ui.QCursor.pos", return_value=right_edge):
+            card._check_cursor()
+        assert card._anim.endValue().x() < geo.x()
+
+    def test_dodge_away_from_cursor_above(self, card):
+        """When cursor approaches from above, card should move downward."""
+        card.move(card._screen.width() // 2, card._screen.height() // 2)
+        geo = card.geometry()
+        above = QPoint(geo.center().x(), geo.top() - CARD_DODGE_PAD + 5)
+        with patch("overlay_ui.QCursor.pos", return_value=above):
+            card._check_cursor()
+        assert card._anim.endValue().y() > geo.y()
+
+    def test_dodge_away_from_cursor_below(self, card):
+        """When cursor approaches from below, card should move upward."""
+        card.move(card._screen.width() // 2, CARD_MIN_H + CARD_MARGIN + 50)
+        geo = card.geometry()
+        below = QPoint(geo.center().x(), geo.bottom() + CARD_DODGE_PAD - 5)
+        with patch("overlay_ui.QCursor.pos", return_value=below):
+            card._check_cursor()
+        assert card._anim.endValue().y() < geo.y()
+
+    def test_dodge_clamped_to_left_margin(self, card):
+        """Card should never go past the left margin."""
+        card.move(CARD_MARGIN, card._screen.height() // 2)
+        geo = card.geometry()
+        right_of_card = QPoint(geo.right() + CARD_DODGE_PAD - 5, geo.center().y())
+        with patch("overlay_ui.QCursor.pos", return_value=right_of_card):
+            card._check_cursor()
+        assert card._anim.endValue().x() >= CARD_MARGIN
+
+    def test_dodge_clamped_to_top_margin(self, card):
+        """Card should never go past the top margin."""
+        card.move(card._screen.width() // 2, CARD_MARGIN)
+        geo = card.geometry()
+        below_card = QPoint(geo.center().x(), geo.bottom() + CARD_DODGE_PAD - 5)
+        with patch("overlay_ui.QCursor.pos", return_value=below_card):
+            card._check_cursor()
+        assert card._anim.endValue().y() >= CARD_MARGIN
+
+    def test_corner_stuck_deflects(self, card):
+        """Card pinned in top-left corner should deflect away instead of
+        staying stuck."""
+        card.move(CARD_MARGIN, CARD_MARGIN)  # pin in top-left
+        geo = card.geometry()
+        # cursor approaches from bottom-right → naive push goes further into corner
+        cursor = QPoint(geo.right() + CARD_DODGE_PAD - 5,
+                        geo.bottom() + CARD_DODGE_PAD - 5)
+        with patch("overlay_ui.QCursor.pos", return_value=cursor):
+            card._check_cursor()
+        # Should have found an escape direction (not stayed at CARD_MARGIN, CARD_MARGIN)
+        end = card._anim.endValue()
+        moved = ((end.x() - CARD_MARGIN) ** 2 + (end.y() - CARD_MARGIN) ** 2) ** 0.5
+        assert moved >= CARD_STUCK_THRESH
+
+    def test_bottom_right_corner_deflects(self, card):
+        """Card pinned in bottom-right corner should escape."""
+        max_x = card._screen.width()  - CARD_W      - CARD_MARGIN
+        max_y = card._screen.height() - CARD_MIN_H  - CARD_MARGIN
+        card.move(max_x, max_y)
+        geo = card.geometry()
+        # cursor from top-left → naive push goes further into corner
+        cursor = QPoint(geo.left() - CARD_DODGE_PAD + 5,
+                        geo.top()  - CARD_DODGE_PAD + 5)
+        with patch("overlay_ui.QCursor.pos", return_value=cursor):
+            card._check_cursor()
+        end = card._anim.endValue()
+        moved = ((end.x() - max_x) ** 2 + (end.y() - max_y) ** 2) ** 0.5
+        assert moved >= CARD_STUCK_THRESH
+
+    def test_dodge_target_returns_none_when_stuck(self, card):
+        """_dodge_target should return None when the movement is < threshold."""
+        card.move(CARD_MARGIN, CARD_MARGIN)
+        # direction pointing into the top-left corner
+        result = card._dodge_target(-1.0, -1.0,
+                                    card.geometry().center().x(),
+                                    card.geometry().center().y())
+        assert result is None
+
+    def test_no_interrupt_during_animation(self, card):
+        """Should not start a new dodge while an animation is running."""
+        card._slide_to(QPoint(100, 100))  # start animation
+        geo = card.geometry()
+        cursor = QPoint(geo.center().x(), geo.center().y())
+        with patch("overlay_ui.QCursor.pos", return_value=cursor):
+            card._check_cursor()  # should be a no-op
+        # The animation target should still be (100, 100)
+        assert card._anim.endValue() == QPoint(100, 100)
 
 
 # -- append_message ------------------------------------------------------------
