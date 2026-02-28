@@ -175,23 +175,43 @@ class TestCursorDodge:
         assert card._anim.endValue() == QPoint(100, 100)
 
 
-# -- append_message ------------------------------------------------------------
+# -- append_message / typewriter -----------------------------------------------
+
+def _finish_typewriter(card):
+    """Pump the typewriter timer until all text is revealed."""
+    while card._type_pos < len(card._type_full_text):
+        card._type_tick()
+
 
 class TestAppendMessage:
-    def test_message_appears_in_history(self, card):
+    def test_message_appears_after_typewriter(self, card):
         card.append_message("You", "hello world")
+        _finish_typewriter(card)
         assert "hello world" in card.history.toPlainText()
 
-    def test_sender_appears_in_history(self, card):
+    def test_sender_appears_immediately(self, card):
         card.append_message("Halo", "some text")
+        # Sender header is set immediately (before typewriter finishes)
         assert "Halo" in card.history.toHtml()
 
-    def test_multiple_messages_accumulate(self, card):
+    def test_only_latest_message_shown(self, card):
         card.append_message("You", "first message")
+        _finish_typewriter(card)
         card.append_message("Halo", "second message")
-        html = card.history.toPlainText()
-        assert "first message" in html
-        assert "second message" in html
+        _finish_typewriter(card)
+        text = card.history.toPlainText()
+        assert "first message" not in text
+        assert "second message" in text
+
+    def test_partial_text_during_typewriter(self, card):
+        card.append_message("You", "abcdefghij")
+        # After one tick, only a partial chunk should be visible
+        assert card._type_pos > 0
+        assert card._type_pos <= len("abcdefghij")
+
+    def test_typewriter_stores_full_text(self, card):
+        card.append_message("You", "the full message")
+        assert card._type_full_text == "the full message"
 
     def test_default_color_parameter_does_not_raise(self, card):
         card.append_message("You", "test")

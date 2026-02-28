@@ -13,6 +13,12 @@ Requires pytest-qt (qtbot fixture).
 import pytest
 from unittest.mock import patch, MagicMock, call
 
+
+def _finish_typewriter(card):
+    """Pump the typewriter timer until all text is revealed."""
+    while card._type_pos < len(card._type_full_text):
+        card._type_tick()
+
 from overlay_ui import HaloApp, PANEL_WIDTH, PANEL_HEIGHT, SCREENSHOT_PATH
 from overlay_ui import SpotlightBar, ResponseCard, SPOTLIGHT_W, SPOTLIGHT_H, CARD_W, CARD_MIN_H, NOTCH_PEEK
 
@@ -100,6 +106,7 @@ class TestStart:
 
     def test_start_appends_welcome_message(self, app):
         app.start()
+        _finish_typewriter(app.card)
         assert "Hello" in app.card.history.toPlainText()
 
     def test_start_shows_halo_as_sender(self, app):
@@ -121,6 +128,7 @@ class TestOnResultSuccess:
 
     def test_appends_message_to_chat(self, app, success_payload):
         app._on_result(success_payload)
+        _finish_typewriter(app.chat)
         assert success_payload["message"] in app.chat.history.toPlainText()
 
     def test_updates_status_to_done(self, app, success_payload):
@@ -145,6 +153,7 @@ class TestOnResultError:
 
     def test_appends_error_message_to_chat(self, app, error_payload):
         app._on_result(error_payload)
+        _finish_typewriter(app.chat)
         assert error_payload["message"] in app.chat.history.toPlainText()
 
     def test_status_resets_to_ready(self, app, error_payload):
@@ -162,10 +171,12 @@ class TestOnResultError:
 class TestOnError:
     def test_appends_error_text_to_chat(self, app):
         app._on_error("Connection refused")
+        _finish_typewriter(app.chat)
         assert "Connection refused" in app.chat.history.toPlainText()
 
     def test_error_label_prefix_in_chat(self, app):
         app._on_error("timeout")
+        _finish_typewriter(app.chat)
         assert "[Error]" in app.chat.history.toPlainText()
 
     def test_status_resets_to_ready(self, app):

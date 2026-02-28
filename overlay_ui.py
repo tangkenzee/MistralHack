@@ -16,6 +16,7 @@ import sys
 import math
 import signal
 import ctypes
+import random
 from pathlib import Path
 import mss
 from PyQt6.QtCore import (
@@ -91,6 +92,9 @@ PANEL_HEIGHT      = 440
 SPOTLIGHT_W       = 534    # spotlight bar width  (matches macOS Spotlight)
 SPOTLIGHT_H       = 44     # spotlight bar height (slimmer, like Spotlight)
 NOTCH_PEEK        = 10     # pixels visible when the notch is collapsed
+NOTCH_BOUNCE_PX   = 12     # how far the notch pops down during bounce
+NOTCH_BOUNCE_MS   = 800    # bounce animation duration (ms)
+NOTCH_BOUNCE_INT  = 5000   # interval between bounces (ms)
 
 # ── Spotlight-specific glass (higher translucency, visible border) ──
 SPOT_GLASS_BASE   = QColor(40, 40, 42, 155)      # lighter, more see-through
@@ -103,6 +107,12 @@ CARD_DODGE_DIST   = 400    # how far the card flies when dodging
 CARD_STUCK_THRESH = 20     # min px movement; below this we try deflecting
 # Modern Apple-like sans-serif; Qt falls back gracefully if unavailable
 FONT_FAMILY       = "Segoe UI Variable"
+
+# ── Typewriter effect ──
+TYPE_MIN_DELAY    = 15     # fastest tick (ms)
+TYPE_MAX_DELAY    = 55     # slowest tick (ms)
+TYPE_MIN_CHARS    = 1      # min chars revealed per tick
+TYPE_MAX_CHARS    = 3      # max chars revealed per tick
 
 SCREENSHOT_PATH   = "raw.png"
 
@@ -447,10 +457,23 @@ class SpotlightBar(QWidget):
         self._anim.setDuration(300)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
+        # Bounce animation — keyframed multi-bounce (drop → bounce → smaller → settle)
+        self._bounce_anim = QPropertyAnimation(self, b"pos")
+        self._bounce_anim.setDuration(NOTCH_BOUNCE_MS)
+        self._bounce_anim.setEasingCurve(QEasingCurve.Type.Linear)  # keyframes drive motion
+        self._bounce_anim.finished.connect(self._on_bounce_done)
+
+        # Periodic timer to trigger bounce while collapsed
+        self._bounce_timer = QTimer(self)
+        self._bounce_timer.setInterval(NOTCH_BOUNCE_INT)
+        self._bounce_timer.timeout.connect(self._do_bounce)
+        self._bounce_timer.start()
+
     def _expand(self):
         if self._expanded:
             return
         self._expanded = True
+        self._bounce_anim.stop()
         self._anim.stop()
         self._anim.setStartValue(self.pos())
         self._anim.setEndValue(QPoint(self._bar_x, self._expanded_y))
@@ -460,10 +483,44 @@ class SpotlightBar(QWidget):
         if not self._expanded:
             return
         self._expanded = False
+        self._bounce_anim.stop()
         self._anim.stop()
         self._anim.setStartValue(self.pos())
         self._anim.setEndValue(QPoint(self._bar_x, self._collapsed_y))
         self._anim.start()
+
+    # ── Periodic bounce ──────────────────────────────────────────────────
+    def _do_bounce(self):
+        """Pop the notch down with realistic multi-bounce inertia."""
+        if self._expanded:
+            return
+        if self._anim.state() == QPropertyAnimation.State.Running:
+            return
+
+        rest = QPoint(self._bar_x, self._collapsed_y)
+        bx = self._bar_x
+        cy = self._collapsed_y
+        pk = NOTCH_BOUNCE_PX
+
+        self._bounce_anim.stop()
+        self._bounce_anim.setStartValue(rest)
+        self._bounce_anim.setEndValue(rest)
+
+        # Keyframes: drop → return → smaller drop → return → tiny drop → settle
+        self._bounce_anim.setKeyValueAt(0.00, QPoint(bx, cy))
+        self._bounce_anim.setKeyValueAt(0.15, QPoint(bx, cy + pk))        # main drop
+        self._bounce_anim.setKeyValueAt(0.35, QPoint(bx, cy))             # bounce back
+        self._bounce_anim.setKeyValueAt(0.50, QPoint(bx, cy + int(pk * 0.45)))  # 2nd drop
+        self._bounce_anim.setKeyValueAt(0.65, QPoint(bx, cy))             # bounce back
+        self._bounce_anim.setKeyValueAt(0.78, QPoint(bx, cy + int(pk * 0.18)))  # 3rd tiny drop
+        self._bounce_anim.setKeyValueAt(0.88, QPoint(bx, cy))             # settle
+        self._bounce_anim.setKeyValueAt(1.00, QPoint(bx, cy))             # rest
+        self._bounce_anim.start()
+
+    def _on_bounce_done(self):
+        """Ensure bar snaps back to collapsed position after bounce."""
+        if not self._expanded:
+            self.move(self._bar_x, self._collapsed_y)
 
     # ── Hover / focus events ─────────────────────────────────────────────
     def enterEvent(self, event):
@@ -544,6 +601,15 @@ class ResponseCard(QWidget):
         self._build_ui()
         self._setup_positions()
         self._start_dodge_timer()
+
+        # Typewriter state
+        self._type_timer = QTimer(self)
+        self._type_timer.setSingleShot(True)
+        self._type_timer.timeout.connect(self._type_tick)
+        self._type_header = ""
+        self._type_body_color = ""
+        self._type_full_text = ""
+        self._type_pos = 0
 
     def _build_ui(self):
         self.setWindowFlags(
@@ -699,11 +765,40 @@ class ResponseCard(QWidget):
         painter.end()
 
     def append_message(self, sender: str, text: str, color: str = "rgba(255,255,255,0.90)"):
+        # Stop any in-progress typewriter
+        self._type_timer.stop()
+
         sender_color = "rgba(255,255,255,0.50)" if sender == "Halo" else "rgba(255,255,255,0.35)"
-        self.history.append(
+        self._type_header = (
             f'<span style="color:{sender_color};font-size:9pt;font-weight:600;">{sender}</span><br>'
-            f'<span style="color:{color};font-size:11pt;">{text}</span><br>'
         )
+        self._type_body_color = color
+        self._type_full_text = text
+        self._type_pos = 0
+
+        # Show header immediately, body will be typed out
+        self.history.clear()
+        self.history.setHtml(self._type_header)
+        self._type_tick()          # kick off first tick immediately
+
+    def _type_tick(self):
+        """Reveal the next chunk of characters."""
+        if self._type_pos >= len(self._type_full_text):
+            self._type_timer.stop()
+            return
+
+        chunk = random.randint(TYPE_MIN_CHARS, TYPE_MAX_CHARS)
+        self._type_pos = min(self._type_pos + chunk, len(self._type_full_text))
+        visible = self._type_full_text[:self._type_pos]
+
+        self.history.setHtml(
+            self._type_header
+            + f'<span style="color:{self._type_body_color};font-size:11pt;">{visible}</span>'
+        )
+
+        # Schedule next tick with randomised delay
+        delay = random.randint(TYPE_MIN_DELAY, TYPE_MAX_DELAY)
+        self._type_timer.start(delay)
 
     def set_status(self, msg: str):
         self.status_label.setText(msg)
