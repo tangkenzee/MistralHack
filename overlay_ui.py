@@ -60,6 +60,16 @@ GLOW_COLOR        = QColor(10, 132, 255, 180)   # iOS system blue
 GLOW_LAYERS       = 7                           # soft concentric rings
 GLOW_THICKNESS    = 28                          # outer glow spread (px)
 
+# ── Dim-overlay (spotlight cutout) ──
+DIM_SCRIM         = QColor(0, 0, 0, 180)        # dark backdrop when highlighting
+CUTOUT_RADIUS     = 12                          # corner radius of the clear cutout
+CUTOUT_BORDER     = QColor(255, 255, 255, 55)   # matches SPOT_GLASS_BORDER
+CUTOUT_BORDER_W   = 1.5                         # border stroke width
+PULSE_RINGS       = 3                           # number of outward-ripple rings
+PULSE_MAX_SPREAD  = 72                          # max px each ring expands outward
+PULSE_DURATION    = 2000                        # full cycle in ms
+PULSE_COLOR       = QColor(255, 255, 255)       # base colour for pulse rings
+
 # ── Glass panel colours ──
 GLASS_BASE        = QColor(22, 22, 24, 190)     # dark base, higher opacity = less see-through
 GLASS_TINT        = QColor(90, 120, 200, 8)     # barely-there cool tint
@@ -145,20 +155,39 @@ class OverlayWindow(QWidget):
     """
     A transparent, frameless, always-on-top window that covers the full
     screen. It is completely click-through so underlying apps still work.
-    Only responsibility: paint the neon glow highlight when told to.
+    Paints a dimmed backdrop with a clear cutout + pulsing border rings.
     """
+
+    # ── Pulse property (0.0 → 1.0 looping) ──────────────────────────────
+    def _get_pulse(self) -> float:
+        return self._pulse
+
+    def _set_pulse(self, val: float):
+        self._pulse = val
+        if self._highlight:
+            self.update()
+
+    pulse_phase = pyqtProperty(float, _get_pulse, _set_pulse)
 
     def __init__(self):
         super().__init__()
         self._highlight: QRect | None = None
+        self._pulse = 0.0
+
+        self._pulse_anim = QPropertyAnimation(self, b"pulse_phase", self)
+        self._pulse_anim.setDuration(PULSE_DURATION)
+        self._pulse_anim.setStartValue(0.0)
+        self._pulse_anim.setEndValue(1.0)
+        self._pulse_anim.setLoopCount(-1)          # loop forever
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowTransparentForInput
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        # Pass all mouse events through to whatever is underneath
+        # WA_ flag for child-widget passthrough (belt-and-suspenders)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         screen: QScreen = QApplication.primaryScreen()
@@ -169,10 +198,13 @@ class OverlayWindow(QWidget):
     # ── Public API ──────────────────────────────────────────────────────────
     def show_highlight(self, x: int, y: int, width: int, height: int):
         self._highlight = QRect(x, y, width, height)
+        self._pulse_anim.start()
         self.update()
 
     def clear_highlight(self):
         self._highlight = None
+        self._pulse_anim.stop()
+        self._pulse = 0.0
         self.update()
 
     # ── Paint ───────────────────────────────────────────────────────────────
@@ -184,46 +216,44 @@ class OverlayWindow(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         rect = self._highlight
-        glow_step = GLOW_THICKNESS // GLOW_LAYERS
+        r = float(CUTOUT_RADIUS)
 
-        # ── Liquid Glass highlight ──────────────────────────────────────
-        # Soft outer glow — many faint rings fading outward
-        for i in range(GLOW_LAYERS, 0, -1):
-            spread = i * glow_step
-            frac   = i / GLOW_LAYERS
-            alpha  = int(90 * frac ** 2.5)
-            color  = QColor(GLOW_COLOR)
-            color.setAlpha(alpha)
+        # 1) Build a path covering the whole screen …
+        full = QPainterPath()
+        full.addRect(QRectF(self.rect()))
 
-            pen = QPen(color, 1.0)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(
-                rect.adjusted(-spread, -spread, spread, spread),
-                14, 14,
-            )
+        # 2) … subtract the highlight rect (rounded) to create a cutout
+        cutout = QPainterPath()
+        cutout.addRoundedRect(QRectF(rect), r, r)
+        dimmed = full - cutout
 
-        # Translucent glass fill inside the highlight rect
-        glass_fill = QColor(10, 132, 255, 22)
+        # 3) Fill the dimmed region
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(glass_fill))
-        painter.drawRoundedRect(rect, 12, 12)
+        painter.setBrush(QBrush(DIM_SCRIM))
+        painter.drawPath(dimmed)
 
-        # Inner specular — bright gradient along top edge
-        spec_grad = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.top() + 18)
-        spec_grad.setColorAt(0.0, QColor(255, 255, 255, 50))
-        spec_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
-        spec_path = QPainterPath()
-        spec_path.addRoundedRect(float(rect.x()), float(rect.y()),
-                                  float(rect.width()), 18.0, 12.0, 12.0)
-        painter.setBrush(QBrush(spec_grad))
-        painter.drawPath(spec_path)
-
-        # Crisp inner border — 1px luminous rim
-        solid_pen = QPen(QColor(10, 132, 255, 160), 1.5)
-        painter.setPen(solid_pen)
+        # 4) Draw a thin glass-style border around the cutout
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(rect, 12, 12)
+        painter.setPen(QPen(CUTOUT_BORDER, CUTOUT_BORDER_W))
+        painter.drawRoundedRect(QRectF(rect), r, r)
+
+        # 5) Pulsing rings radiating outward from the border
+        phase = self._pulse
+        for i in range(PULSE_RINGS):
+            # Stagger each ring evenly across the cycle
+            ring_phase = (phase + i / PULSE_RINGS) % 1.0
+            spread = ring_phase * PULSE_MAX_SPREAD
+            # Fade out as the ring expands (peaks at ~0.15, fades to 0)
+            alpha = int(160 * (1.0 - ring_phase) ** 1.5)
+            if alpha < 1:
+                continue
+            c = QColor(PULSE_COLOR)
+            c.setAlpha(alpha)
+            painter.setPen(QPen(c, 1.5))
+            painter.drawRoundedRect(
+                QRectF(rect).adjusted(-spread, -spread, spread, spread),
+                r + spread * 0.3, r + spread * 0.3,
+            )
 
         painter.end()
 
@@ -703,6 +733,9 @@ class HaloApp:
         self.overlay.show()
         self.bar.show()
         self.card.show()
+        # Ensure bar & card render above the dim overlay
+        self.bar.raise_()
+        self.card.raise_()
         self.card.append_message(
             "Halo",
             "Hello! I'm here to help you navigate. What do you need?",

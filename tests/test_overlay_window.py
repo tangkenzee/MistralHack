@@ -12,7 +12,11 @@ from unittest.mock import patch, MagicMock
 from PyQt6.QtCore import Qt, QRect
 from PyQt6.QtWidgets import QApplication
 
-from overlay_ui import OverlayWindow, _exclude_from_capture, WDA_EXCLUDEFROMCAPTURE
+from overlay_ui import (
+    OverlayWindow, _exclude_from_capture, WDA_EXCLUDEFROMCAPTURE,
+    DIM_SCRIM, CUTOUT_RADIUS, CUTOUT_BORDER, CUTOUT_BORDER_W,
+    PULSE_RINGS, PULSE_MAX_SPREAD, PULSE_DURATION, PULSE_COLOR,
+)
 
 
 @pytest.fixture
@@ -29,6 +33,13 @@ class TestConstruction:
     def test_highlight_is_none_on_init(self, overlay):
         assert overlay._highlight is None
 
+    def test_pulse_phase_starts_at_zero(self, overlay):
+        assert overlay._pulse == 0.0
+
+    def test_pulse_anim_not_running_on_init(self, overlay):
+        from PyQt6.QtCore import QPropertyAnimation
+        assert overlay._pulse_anim.state() != QPropertyAnimation.State.Running
+
     def test_window_flag_frameless(self, overlay):
         flags = overlay.windowFlags()
         assert flags & Qt.WindowType.FramelessWindowHint
@@ -41,6 +52,10 @@ class TestConstruction:
         flags = overlay.windowFlags()
         assert flags & Qt.WindowType.Tool
 
+    def test_window_flag_transparent_for_input(self, overlay):
+        flags = overlay.windowFlags()
+        assert flags & Qt.WindowType.WindowTransparentForInput
+
     def test_attribute_translucent_background(self, overlay):
         assert overlay.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
@@ -50,6 +65,25 @@ class TestConstruction:
     def test_geometry_matches_primary_screen(self, overlay):
         screen_geo = QApplication.primaryScreen().geometry()
         assert overlay.geometry() == screen_geo
+
+
+# ── Dim-scrim constants ──────────────────────────────────────────────────────
+
+class TestDimScrimConstants:
+    def test_dim_scrim_is_semitransparent_black(self):
+        assert DIM_SCRIM.red() == 0
+        assert DIM_SCRIM.green() == 0
+        assert DIM_SCRIM.blue() == 0
+        assert 0 < DIM_SCRIM.alpha() < 255
+
+    def test_cutout_radius_positive(self):
+        assert CUTOUT_RADIUS > 0
+
+    def test_cutout_border_has_alpha(self):
+        assert 0 < CUTOUT_BORDER.alpha() < 255
+
+    def test_cutout_border_width_positive(self):
+        assert CUTOUT_BORDER_W > 0
 
 
 # ── show_highlight ────────────────────────────────────────────────────────────
@@ -76,14 +110,26 @@ class TestShowHighlight:
         overlay.show_highlight(3840, 2160, 800, 200)
         assert overlay._highlight == QRect(3840, 2160, 800, 200)
 
+    def test_pulse_starts_on_highlight(self, overlay):
+        overlay.show_highlight(10, 10, 100, 50)
+        from PyQt6.QtCore import QPropertyAnimation
+        assert overlay._pulse_anim.state() == QPropertyAnimation.State.Running
 
-# ── clear_highlight ───────────────────────────────────────────────────────────
+
+# ── clear_highlight ─────────────────────────────────────────────────────────
 
 class TestClearHighlight:
     def test_clears_after_show(self, overlay):
         overlay.show_highlight(100, 200, 150, 30)
         overlay.clear_highlight()
         assert overlay._highlight is None
+
+    def test_pulse_stops_on_clear(self, overlay):
+        overlay.show_highlight(10, 10, 100, 50)
+        overlay.clear_highlight()
+        from PyQt6.QtCore import QPropertyAnimation
+        assert overlay._pulse_anim.state() != QPropertyAnimation.State.Running
+        assert overlay._pulse == 0.0
 
     def test_clear_when_already_none_is_safe(self, overlay):
         """Calling clear with no active highlight must not raise."""
