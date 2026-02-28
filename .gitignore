@@ -1,1 +1,5 @@
 .env
+images
+venv
+ai_brain/__pycache__
+__pycache__ 
