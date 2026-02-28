@@ -8,10 +8,11 @@ Requires pytest-qt (qtbot fixture).
 """
 
 import pytest
+from unittest.mock import patch, MagicMock
 from PyQt6.QtCore import Qt, QRect
 from PyQt6.QtWidgets import QApplication
 
-from overlay_ui import OverlayWindow
+from overlay_ui import OverlayWindow, _exclude_from_capture, WDA_EXCLUDEFROMCAPTURE
 
 
 @pytest.fixture
@@ -115,3 +116,41 @@ class TestPaintEvent:
         overlay.clear_highlight()
         overlay.show()
         overlay.repaint()
+
+
+# ── Capture exclusion ─────────────────────────────────────────────────────────
+
+class TestCaptureExclusion:
+    def test_constant_value(self):
+        assert WDA_EXCLUDEFROMCAPTURE == 0x00000011
+
+    def test_exclude_calls_set_window_display_affinity(self, overlay):
+        """_exclude_from_capture should call SetWindowDisplayAffinity with
+        the widget's HWND and WDA_EXCLUDEFROMCAPTURE."""
+        mock_set = MagicMock()
+        with patch("overlay_ui.ctypes") as mock_ctypes, \
+             patch("overlay_ui.sys") as mock_sys:
+            mock_sys.platform = "win32"
+            mock_ctypes.windll.user32.SetWindowDisplayAffinity = mock_set
+            _exclude_from_capture(overlay)
+            mock_set.assert_called_once_with(
+                int(overlay.winId()), WDA_EXCLUDEFROMCAPTURE
+            )
+
+    def test_exclude_noop_on_non_windows(self, overlay):
+        """On non-Windows platforms _exclude_from_capture should do nothing."""
+        mock_set = MagicMock()
+        with patch("overlay_ui.ctypes") as mock_ctypes, \
+             patch("overlay_ui.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            mock_ctypes.windll.user32.SetWindowDisplayAffinity = mock_set
+            _exclude_from_capture(overlay)
+            mock_set.assert_not_called()
+
+    def test_exclude_swallows_exceptions(self, overlay):
+        """Should not crash even if the Win32 call fails."""
+        with patch("overlay_ui.ctypes") as mock_ctypes, \
+             patch("overlay_ui.sys") as mock_sys:
+            mock_sys.platform = "win32"
+            mock_ctypes.windll.user32.SetWindowDisplayAffinity.side_effect = OSError
+            _exclude_from_capture(overlay)  # must not raise

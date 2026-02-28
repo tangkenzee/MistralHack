@@ -15,6 +15,7 @@ Architecture:
 import sys
 import math
 import signal
+import ctypes
 from pathlib import Path
 import mss
 from PyQt6.QtCore import (
@@ -95,6 +96,23 @@ FONT_FAMILY       = "Segoe UI Variable"
 
 SCREENSHOT_PATH   = "raw.png"
 
+# Windows 10 2004+ flag: window is visible on screen but excluded from
+# all capture APIs (mss, PrintScreen, OBS, etc.).
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+def _exclude_from_capture(widget):
+    """Mark *widget* invisible to screenshot / screen-capture tools.
+    Uses SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE).  Requires the
+    native HWND, so we call winId() first (creates it if needed).
+    Silently ignored on non-Windows or older builds."""
+    if sys.platform != "win32":
+        return
+    try:
+        hwnd = int(widget.winId())
+        ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+    except Exception:
+        pass   # gracefully degrade on older Windows
+
 
 # ─── Worker Thread ────────────────────────────────────────────────────────────
 class AIWorker(QThread):
@@ -146,6 +164,7 @@ class OverlayWindow(QWidget):
         screen: QScreen = QApplication.primaryScreen()
         self.setGeometry(screen.geometry())
         self.setStyleSheet("background: transparent;")
+        _exclude_from_capture(self)
 
     # ── Public API ──────────────────────────────────────────────────────────
     def show_highlight(self, x: int, y: int, width: int, height: int):
@@ -344,6 +363,7 @@ class SpotlightBar(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(SPOTLIGHT_W, SPOTLIGHT_H)
+        _exclude_from_capture(self)
 
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(28)
@@ -504,6 +524,7 @@ class ResponseCard(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents) 
         self.setFixedSize(CARD_W, CARD_MIN_H)
+        _exclude_from_capture(self)
 
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(28)
