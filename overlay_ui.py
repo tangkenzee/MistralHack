@@ -114,7 +114,7 @@ TYPE_MAX_DELAY    = 55     # slowest tick (ms)
 TYPE_MIN_CHARS    = 1      # min chars revealed per tick
 TYPE_MAX_CHARS    = 3      # max chars revealed per tick
 
-SCREENSHOT_PATH   = "raw.png"
+SCREENSHOT_PATH   = "images/raw.png"
 
 # Windows 10 2004+ flag: window is visible on screen but excluded from
 # all capture APIs (mss, PrintScreen, OBS, etc.).
