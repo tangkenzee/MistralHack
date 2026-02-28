@@ -36,7 +36,7 @@ import ai_brain
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 _ROOT      = Path(__file__).parent
-_ICON_PATH = _ROOT / "icons" / "oakley.svg"
+_ICON_PATH = _ROOT / "icons" / "halo_logo.svg"
 
 
 def _make_icon_pixmap(size: int = 32) -> QPixmap:
