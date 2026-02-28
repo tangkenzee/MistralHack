@@ -796,7 +796,7 @@ class HaloApp:
                 result["x"], result["y"],
                 result["width"], result["height"],
             )
-            self.card.append_message("Halo", result["message"], "rgba(48,209,88,0.75)")
+            self.card.append_message("Halo", result["message"])
             self.bar.set_status("Tap the highlighted area")
             self.card.set_status("Tap the highlighted area")
         else:
