@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test OpenCV Elements Extraction</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            height: 100vh;
+            margin: 0;
+            position: relative;
+            background-color: #f8f9fa; /* Light grey background to help contrast */
+        }
+        .element-btn {
+            position: absolute;
+            padding: 15px 30px;
+            font-size: 18px;
+            font-weight: bold;
+            color: white;
+            border: 2px solid #333; /* Distinct border for OpenCV to detect easily */
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
+        }
+        #btn-top-left { 
+            top: 10%; 
+            left: 10%; 
+            background-color: #007bff; 
+        }
+        #btn-top-right { 
+            top: 15%; 
+            right: 10%; 
+            background-color: #28a745; 
+        }
+        #btn-bottom-left { 
+            bottom: 20%; 
+            left: 15%; 
+            background-color: #dc3545; 
+        }
+        #btn-bottom-right { 
+            bottom: 15%; 
+            right: 20%; 
+            background-color: #ffc107; 
+            color: black; 
+        }
+        #btn-center { 
+            top: 50%; 
+            left: 50%; 
+            transform: translate(-50%, -50%); 
+            background-color: #17a2b8; 
+            padding: 20px 40px;
+            font-size: 24px;
+        }
+        .header-box {
+            position: absolute;
+            top: 2%;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 10px 20px;
+            border: 2px solid black;
+            background: white;
+            font-size: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header-box">OpenCV Boundary Detection Test Page</div>
+    
+    <button id="btn-top-left" class="element-btn">Top Left Button</button>
+    <button id="btn-top-right" class="element-btn">Top Right Button</button>
+    <button id="btn-bottom-left" class="element-btn">Bottom Left Button</button>
+    <button id="btn-bottom-right" class="element-btn">Bottom Right Button</button>
+    <button id="btn-center" class="element-btn">Center Button</button>
+</body>
+</html>
