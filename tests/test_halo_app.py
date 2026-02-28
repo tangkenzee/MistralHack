@@ -11,7 +11,7 @@ Requires pytest-qt (qtbot fixture).
 """
 
 import pytest
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 
 def _finish_typewriter(card):
@@ -19,7 +19,7 @@ def _finish_typewriter(card):
     while card._type_pos < len(card._type_full_text):
         card._type_tick()
 
-from overlay_ui import HaloApp, PANEL_WIDTH, PANEL_HEIGHT, SCREENSHOT_PATH
+from overlay_ui import HaloApp, SCREENSHOT_PATH
 from overlay_ui import SpotlightBar, ResponseCard, SPOTLIGHT_W, SPOTLIGHT_H, CARD_W, CARD_MIN_H, NOTCH_PEEK
 
 

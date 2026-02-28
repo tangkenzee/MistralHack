@@ -2,14 +2,16 @@
 Halo - overlay_ui.py
 ====================
 The "Glass" layer: a transparent, frameless, always-on-top PyQt6 overlay
-with a floating chat panel. Delegates all AI/vision work to ai_brain.py
-via AIWorker (QThread) so the UI never blocks.
+with a spotlight input bar and cursor-dodging response card.
+Delegates all AI/vision work to ai_brain.py via AIWorker (QThread)
+so the UI never blocks.
 
 Architecture:
-  OverlayWindow  – full-screen, click-through, paints the glowing highlight.
-  ChatPanel      – draggable floating dark panel; handles user input.
+  OverlayWindow  – full-screen, click-through, paints dim scrim + clear cutout.
+  SpotlightBar   – iPhone-notch-style input bar fused to top-centre of screen.
+  ResponseCard   – always-visible reply card that dodges the cursor.
   AIWorker       – background thread that calls ai_brain.get_target_coordinates.
-  HaloApp        – top-level wiring that owns both windows.
+  HaloApp        – top-level wiring that owns all windows.
 """
 
 import sys
@@ -23,10 +25,9 @@ from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QRect, QPoint, QRectF,
     QPropertyAnimation, QEasingCurve, QEvent, pyqtProperty, QTimer,
 )
-from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtGui import (
-    QColor, QPainter, QPen, QFont, QScreen, QPixmap, QIcon,
-    QLinearGradient, QBrush, QPainterPath, QPalette, QCursor,
+    QColor, QPainter, QPen, QFont, QScreen, QIcon,
+    QBrush, QPainterPath, QPalette, QCursor,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -41,26 +42,7 @@ _ROOT      = Path(__file__).parent
 _ICON_PATH = _ROOT / "icons" / "halo_logo.svg"
 
 
-def _make_icon_pixmap(size: int = 32) -> QPixmap:
-    """Render the Halo SVG logo at full device resolution for crisp HiDPI display."""
-    dpr = QApplication.primaryScreen().devicePixelRatio() if QApplication.instance() else 2.0
-    physical = int(size * dpr)
-    pm = QPixmap(physical, physical)
-    pm.fill(Qt.GlobalColor.transparent)
-    renderer = QSvgRenderer(str(_ICON_PATH))
-    p = QPainter(pm)
-    renderer.render(p)
-    p.end()
-    pm.setDevicePixelRatio(dpr)
-    return pm
-
-
 # ─── Constants ────────────────────────────────────────────────────────────────
-# Apple Liquid Glass palette (dark mode)
-GLOW_COLOR        = QColor(10, 132, 255, 180)   # iOS system blue
-GLOW_LAYERS       = 7                           # soft concentric rings
-GLOW_THICKNESS    = 28                          # outer glow spread (px)
-
 # ── Dim-overlay (spotlight cutout) ──
 DIM_SCRIM         = QColor(0, 0, 0, 180)        # dark backdrop when highlighting
 CUTOUT_RADIUS     = 12                          # corner radius of the clear cutout
@@ -71,34 +53,17 @@ PULSE_MAX_SPREAD  = 72                          # max px each ring expands outwa
 PULSE_DURATION    = 2000                        # full cycle in ms
 PULSE_COLOR       = QColor(255, 255, 255)       # base colour for pulse rings
 
-# ── Glass panel colours ──
-GLASS_BASE        = QColor(22, 22, 24, 190)     # dark base, higher opacity = less see-through
-GLASS_TINT        = QColor(90, 120, 200, 8)     # barely-there cool tint
-GLASS_BORDER_TOP  = QColor(255, 255, 255, 32)   # brighter top edge
-GLASS_BORDER      = QColor(255, 255, 255, 14)   # subtle rim everywhere else
-GLASS_CORNER_R    = 22                          # corner radius
-GLASS_SHADOW_R    = 40                          # drop-shadow blur
-GLASS_SHADOW_OFF  = 6                           # drop-shadow Y offset
-GLASS_SHADOW_CLR  = QColor(0, 0, 0, 100)        # shadow colour
-
-PANEL_ACCENT      = "#0A84FF"                   # iOS system blue (dark)
-PANEL_ACCENT_CLR  = QColor(10, 132, 255)
-PANEL_TEXT        = "#FFFFFF"
-PANEL_TEXT_DIM    = "rgba(235, 235, 245, 150)"
-PANEL_INPUT_BG    = "rgba(255, 255, 255, 8)"    # very subtle glass fill
-PANEL_INPUT_BORDER= "rgba(255, 255, 255, 16)"
-PANEL_WIDTH       = 360
-PANEL_HEIGHT      = 440
-SPOTLIGHT_W       = 534    # spotlight bar width  (matches macOS Spotlight)
+# ── Spotlight-specific glass ──
 SPOTLIGHT_H       = 44     # spotlight bar height (slimmer, like Spotlight)
 NOTCH_PEEK        = 10     # pixels visible when the notch is collapsed
 NOTCH_BOUNCE_PX   = 12     # how far the notch pops down during bounce
 NOTCH_BOUNCE_MS   = 800    # bounce animation duration (ms)
 NOTCH_BOUNCE_INT  = 5000   # interval between bounces (ms)
 
-# ── Spotlight-specific glass (higher translucency, visible border) ──
+# ── Spotlight-specific glass ──
 SPOT_GLASS_BASE   = QColor(40, 40, 42, 155)      # lighter, more see-through
 SPOT_GLASS_BORDER = QColor(255, 255, 255, 55)     # clearly visible thin rim
+SPOTLIGHT_W       = 534    # spotlight bar width  (matches macOS Spotlight)
 CARD_W            = 340    # response card width
 CARD_MIN_H        = 320    # response card height (taller for message history)
 CARD_MARGIN       = 16     # gap between card edge and screen edge
@@ -348,32 +313,6 @@ class GlassButton(QPushButton):
         p.setFont(self.font())
         p.drawText(rect.toRect(), Qt.AlignmentFlag.AlignCenter, self.text())
         p.end()
-
-# ─── Shared Glass Paint Helper ─────────────────────────────────────────────────
-def _paint_glass(painter, w: int, h: int, r: float):
-    """Liquid Glass fill + border. Call inside a paintEvent."""
-    from PyQt6.QtGui import QPainterPath, QBrush, QLinearGradient, QPen, QColor
-    from PyQt6.QtCore import QRectF, Qt
-
-    body = QPainterPath()
-    body.addRoundedRect(0.0, 0.0, float(w), float(h), r, r)
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QBrush(GLASS_BASE))
-    painter.drawPath(body)
-    painter.setBrush(QBrush(GLASS_TINT))
-    painter.drawPath(body)
-    grad = QLinearGradient(0, 0, 0, h * 0.45)
-    grad.setColorAt(0.0, QColor(255, 255, 255, 12))
-    grad.setColorAt(1.0, QColor(255, 255, 255, 0))
-    painter.setBrush(QBrush(grad))
-    painter.drawPath(body)
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.setPen(QPen(GLASS_BORDER, 0.5))
-    painter.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), r, r)
-    painter.setClipRect(QRectF(0, 0, w, 3))
-    painter.setPen(QPen(GLASS_BORDER_TOP, 1.0))
-    painter.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), r, r)
-    painter.setClipping(False)
 
 
 # ─── Notch Input Bar ──────────────────────────────────────────────────────────
