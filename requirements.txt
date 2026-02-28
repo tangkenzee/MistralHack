@@ -1,6 +1,12 @@
+# Halo dependencies
+PyQt6>=6.6.0
 mss
 opencv-python
 numpy
 mistralai
 python-dotenv
 keyboard
+
+# Testing
+pytest>=8.0.0
+pytest-qt>=4.4.0
