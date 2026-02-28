@@ -1,0 +1,705 @@
+"""
+Halo - overlay_ui.py
+====================
+The "Glass" layer: a transparent, frameless, always-on-top PyQt6 overlay
+with a floating chat panel. Delegates all AI/vision work to ai_brain.py
+via AIWorker (QThread) so the UI never blocks.
+
+Architecture:
+  OverlayWindow  – full-screen, click-through, paints the glowing highlight.
+  ChatPanel      – draggable floating dark panel; handles user input.
+  AIWorker       – background thread that calls ai_brain.get_target_coordinates.
+  HaloApp        – top-level wiring that owns both windows.
+"""
+
+import sys
+import signal
+from pathlib import Path
+import mss
+from PyQt6.QtCore import (
+    Qt, QThread, pyqtSignal, QRect, QPoint, QRectF,
+    QPropertyAnimation, QEasingCurve, QEvent, pyqtProperty, QTimer,
+)
+from PyQt6.QtSvg import QSvgRenderer
+from PyQt6.QtGui import (
+    QColor, QPainter, QPen, QFont, QScreen, QPixmap, QIcon,
+    QLinearGradient, QBrush, QPainterPath, QPalette, QCursor,
+)
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QTextEdit, QLineEdit, QPushButton, QLabel,
+    QGraphicsDropShadowEffect,
+)
+
+import ai_brain
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+_ROOT      = Path(__file__).parent
+_ICON_PATH = _ROOT / "icons" / "oakley.svg"
+
+
+def _make_icon_pixmap(size: int = 32) -> QPixmap:
+    """Render the Halo SVG logo at full device resolution for crisp HiDPI display."""
+    dpr = QApplication.primaryScreen().devicePixelRatio() if QApplication.instance() else 2.0
+    physical = int(size * dpr)
+    pm = QPixmap(physical, physical)
+    pm.fill(Qt.GlobalColor.transparent)
+    renderer = QSvgRenderer(str(_ICON_PATH))
+    p = QPainter(pm)
+    renderer.render(p)
+    p.end()
+    pm.setDevicePixelRatio(dpr)
+    return pm
+
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+# Apple Liquid Glass palette (dark mode)
+GLOW_COLOR        = QColor(10, 132, 255, 180)   # iOS system blue
+GLOW_LAYERS       = 7                           # soft concentric rings
+GLOW_THICKNESS    = 28                          # outer glow spread (px)
+
+# ── Glass panel colours ──
+GLASS_BASE        = QColor(22, 22, 24, 190)     # dark base, higher opacity = less see-through
+GLASS_TINT        = QColor(90, 120, 200, 8)     # barely-there cool tint
+GLASS_BORDER_TOP  = QColor(255, 255, 255, 32)   # brighter top edge
+GLASS_BORDER      = QColor(255, 255, 255, 14)   # subtle rim everywhere else
+GLASS_CORNER_R    = 22                          # corner radius
+GLASS_SHADOW_R    = 40                          # drop-shadow blur
+GLASS_SHADOW_OFF  = 6                           # drop-shadow Y offset
+GLASS_SHADOW_CLR  = QColor(0, 0, 0, 100)        # shadow colour
+
+PANEL_ACCENT      = "#0A84FF"                   # iOS system blue (dark)
+PANEL_ACCENT_CLR  = QColor(10, 132, 255)
+PANEL_TEXT        = "#FFFFFF"
+PANEL_TEXT_DIM    = "rgba(235, 235, 245, 150)"
+PANEL_INPUT_BG    = "rgba(255, 255, 255, 8)"    # very subtle glass fill
+PANEL_INPUT_BORDER= "rgba(255, 255, 255, 16)"
+PANEL_WIDTH       = 360
+PANEL_HEIGHT      = 440
+SPOTLIGHT_W       = 534    # spotlight bar width  (matches macOS Spotlight)
+SPOTLIGHT_H       = 44     # spotlight bar height (slimmer, like Spotlight)
+NOTCH_PEEK        = 10     # pixels visible when the notch is collapsed
+
+# ── Spotlight-specific glass (higher translucency, visible border) ──
+SPOT_GLASS_BASE   = QColor(40, 40, 42, 155)      # lighter, more see-through
+SPOT_GLASS_BORDER = QColor(255, 255, 255, 55)     # clearly visible thin rim
+CARD_W            = 340    # response card width
+CARD_MIN_H        = 320    # response card height (taller for message history)
+CARD_MARGIN       = 16     # gap between card edge and screen edge
+CARD_DODGE_PAD    = 60     # proximity threshold to start dodging cursor
+# Modern Apple-like sans-serif; Qt falls back gracefully if unavailable
+FONT_FAMILY       = "Segoe UI Variable"
+
+SCREENSHOT_PATH   = "raw.png"
+
+
+# ─── Worker Thread ────────────────────────────────────────────────────────────
+class AIWorker(QThread):
+    """
+    Runs ai_brain.get_target_coordinates in a background thread.
+    Emits `result_ready` with the returned dict when done,
+    or `error` with a message string on failure.
+    """
+    result_ready = pyqtSignal(dict)
+    error        = pyqtSignal(str)
+
+    def __init__(self, screenshot_path: str, user_prompt: str):
+        super().__init__()
+        self.screenshot_path = screenshot_path
+        self.user_prompt     = user_prompt
+
+    def run(self):
+        try:
+            result = ai_brain.get_target_coordinates(
+                self.screenshot_path,
+                self.user_prompt,
+            )
+            self.result_ready.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# ─── Full-Screen Overlay (paint-only, click-through) ─────────────────────────
+class OverlayWindow(QWidget):
+    """
+    A transparent, frameless, always-on-top window that covers the full
+    screen. It is completely click-through so underlying apps still work.
+    Only responsibility: paint the neon glow highlight when told to.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._highlight: QRect | None = None
+
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Pass all mouse events through to whatever is underneath
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        screen: QScreen = QApplication.primaryScreen()
+        self.setGeometry(screen.geometry())
+        self.setStyleSheet("background: transparent;")
+
+    # ── Public API ──────────────────────────────────────────────────────────
+    def show_highlight(self, x: int, y: int, width: int, height: int):
+        self._highlight = QRect(x, y, width, height)
+        self.update()
+
+    def clear_highlight(self):
+        self._highlight = None
+        self.update()
+
+    # ── Paint ───────────────────────────────────────────────────────────────
+    def paintEvent(self, _event):
+        if not self._highlight:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rect = self._highlight
+        glow_step = GLOW_THICKNESS // GLOW_LAYERS
+
+        # ── Liquid Glass highlight ──────────────────────────────────────
+        # Soft outer glow — many faint rings fading outward
+        for i in range(GLOW_LAYERS, 0, -1):
+            spread = i * glow_step
+            frac   = i / GLOW_LAYERS
+            alpha  = int(90 * frac ** 2.5)
+            color  = QColor(GLOW_COLOR)
+            color.setAlpha(alpha)
+
+            pen = QPen(color, 1.0)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(
+                rect.adjusted(-spread, -spread, spread, spread),
+                14, 14,
+            )
+
+        # Translucent glass fill inside the highlight rect
+        glass_fill = QColor(10, 132, 255, 22)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(glass_fill))
+        painter.drawRoundedRect(rect, 12, 12)
+
+        # Inner specular — bright gradient along top edge
+        spec_grad = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.top() + 18)
+        spec_grad.setColorAt(0.0, QColor(255, 255, 255, 50))
+        spec_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+        spec_path = QPainterPath()
+        spec_path.addRoundedRect(float(rect.x()), float(rect.y()),
+                                  float(rect.width()), 18.0, 12.0, 12.0)
+        painter.setBrush(QBrush(spec_grad))
+        painter.drawPath(spec_path)
+
+        # Crisp inner border — 1px luminous rim
+        solid_pen = QPen(QColor(10, 132, 255, 160), 1.5)
+        painter.setPen(solid_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect, 12, 12)
+
+        painter.end()
+
+# ─── Animated Glass Button ─────────────────────────────────────────────────
+class GlassButton(QPushButton):
+    """
+    Pill button with a smooth frosted-glass hover animation.
+    Starts as a barely-visible rim; brightens on hover; dims on press.
+    No solid colour — purely achromatic glass.
+    """
+
+    def _get_hover(self) -> float:
+        return self._hover
+
+    def _set_hover(self, val: float):
+        self._hover = val
+        self.update()
+
+    hover_progress = pyqtProperty(float, _get_hover, _set_hover)
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._hover = 0.0
+        self._anim = QPropertyAnimation(self, b"hover_progress", self)
+        self._anim.setDuration(180)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFlat(True)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def event(self, e):
+        t = e.type()
+        if t == QEvent.Type.HoverEnter:
+            self._anim.stop()
+            self._anim.setStartValue(self._hover)
+            self._anim.setEndValue(1.0)
+            self._anim.start()
+        elif t == QEvent.Type.HoverLeave:
+            self._anim.stop()
+            self._anim.setStartValue(self._hover)
+            self._anim.setEndValue(0.0)
+            self._anim.start()
+        return super().event(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        r = h / 2.0
+        rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+        t = self._hover
+        scale = 0.72 if self.isDown() else 1.0
+        enabled = self.isEnabled()
+        opacity = 0.35 if not enabled else 1.0
+
+        # Frosted fill: faint at rest → brighter on hover
+        fill_a = int((12 + t * 38) * scale * opacity)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(255, 255, 255, fill_a)))
+        p.drawRoundedRect(rect, r, r)
+
+        # Outer glow — wide soft ring that blooms on hover
+        glow_a = int(t * 38 * scale * opacity)
+        if glow_a > 0:
+            glow_pen = QPen(QColor(255, 255, 255, glow_a), 4.0)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(glow_pen)
+            p.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), r, r)
+
+        # Rim: clearly visible at rest → full white on hover
+        rim_a = int((75 + t * 145) * scale * opacity)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, rim_a), 1.2))
+        p.drawRoundedRect(rect, r, r)
+
+        # Icon glyph
+        icon_a = int((140 + t * 115) * scale * opacity)
+        pen = QPen(QColor(255, 255, 255, icon_a))
+        pen.setWidthF(1.0)
+        p.setPen(pen)
+        p.setFont(self.font())
+        p.drawText(rect.toRect(), Qt.AlignmentFlag.AlignCenter, self.text())
+        p.end()
+
+# ─── Shared Glass Paint Helper ─────────────────────────────────────────────────
+def _paint_glass(painter, w: int, h: int, r: float):
+    """Liquid Glass fill + border. Call inside a paintEvent."""
+    from PyQt6.QtGui import QPainterPath, QBrush, QLinearGradient, QPen, QColor
+    from PyQt6.QtCore import QRectF, Qt
+
+    body = QPainterPath()
+    body.addRoundedRect(0.0, 0.0, float(w), float(h), r, r)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(GLASS_BASE))
+    painter.drawPath(body)
+    painter.setBrush(QBrush(GLASS_TINT))
+    painter.drawPath(body)
+    grad = QLinearGradient(0, 0, 0, h * 0.45)
+    grad.setColorAt(0.0, QColor(255, 255, 255, 12))
+    grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+    painter.setBrush(QBrush(grad))
+    painter.drawPath(body)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(QPen(GLASS_BORDER, 0.5))
+    painter.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), r, r)
+    painter.setClipRect(QRectF(0, 0, w, 3))
+    painter.setPen(QPen(GLASS_BORDER_TOP, 1.0))
+    painter.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), r, r)
+    painter.setClipping(False)
+
+
+# ─── Notch Input Bar ──────────────────────────────────────────────────────────
+class SpotlightBar(QWidget):
+    """
+    iPhone-notch-style input bar fused to the top-centre of the screen.
+    In its default (collapsed) state only a small tab peeks down from
+    the top edge.  Hovering over the tab slides the full bar into view;
+    moving the mouse away (and removing input focus) collapses it again.
+    Emits user_submitted(prompt) on send.
+    """
+    user_submitted = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._expanded = False
+        self.status_label = QLabel("Ready")
+        self._build_ui()
+        self._setup_notch()
+
+    # ── UI construction ──────────────────────────────────────────────────
+    def _build_ui(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(SPOTLIGHT_W, SPOTLIGHT_H)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QColor(0, 0, 0, 80))
+        self.setGraphicsEffect(shadow)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(8)
+
+        # Magnifying-glass icon (Segoe MDL2 Assets ships with Windows 10/11)
+        search_icon = QLabel("\uE721")
+        search_icon.setFont(QFont("Segoe MDL2 Assets", 14))
+        search_icon.setStyleSheet("color: rgba(255, 255, 255, 110);")
+        search_icon.setFixedSize(22, 22)
+        search_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        search_icon.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self.input_box = QLineEdit()
+        self.input_box.setPlaceholderText("Ask Halo\u2026")
+        self.input_box.setFont(QFont(FONT_FAMILY, 15))
+        self.input_box.setStyleSheet("""
+            QLineEdit {
+                background: transparent;
+                color: rgba(255, 255, 255, 230);
+                border: none;
+                padding: 0px;
+            }
+        """)
+        # Muted placeholder text colour (matches Spotlight ~47% white)
+        pal = self.input_box.palette()
+        pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(255, 255, 255, 120))
+        self.input_box.setPalette(pal)
+        self.input_box.returnPressed.connect(self._on_send)
+        self.input_box.installEventFilter(self)   # track focus-out
+
+        layout.addWidget(search_icon)
+        layout.addWidget(self.input_box, stretch=1)
+
+    # ── Notch positioning & animation ────────────────────────────────────
+    def _setup_notch(self):
+        """Compute collapsed / expanded Y values and create the slide animation."""
+        screen = QApplication.primaryScreen().geometry()
+        self._bar_x = (screen.width() - SPOTLIGHT_W) // 2
+        self._expanded_y = 0
+        self._collapsed_y = -(SPOTLIGHT_H - NOTCH_PEEK)
+        self.move(self._bar_x, self._collapsed_y)
+
+        self._anim = QPropertyAnimation(self, b"pos")
+        self._anim.setDuration(300)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def _expand(self):
+        if self._expanded:
+            return
+        self._expanded = True
+        self._anim.stop()
+        self._anim.setStartValue(self.pos())
+        self._anim.setEndValue(QPoint(self._bar_x, self._expanded_y))
+        self._anim.start()
+
+    def _collapse(self):
+        if not self._expanded:
+            return
+        self._expanded = False
+        self._anim.stop()
+        self._anim.setStartValue(self.pos())
+        self._anim.setEndValue(QPoint(self._bar_x, self._collapsed_y))
+        self._anim.start()
+
+    # ── Hover / focus events ─────────────────────────────────────────────
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._expand()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if not self.input_box.hasFocus():
+            self._collapse()
+
+    def eventFilter(self, obj, event):
+        """Collapse when the input loses focus and the mouse is outside."""
+        if obj is self.input_box and event.type() == QEvent.Type.FocusOut:
+            if not self.underMouse():
+                self._collapse()
+        return super().eventFilter(obj, event)
+
+    # ── Paint: notch shape (flat top, rounded bottom corners) ────────────
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = float(self.width()), float(self.height())
+        r = h / 2.0          # full pill radius for bottom corners
+
+        # Notch shape: flat top, rounded bottom
+        path = QPainterPath()
+        path.moveTo(0, 0)
+        path.lineTo(w, 0)
+        path.lineTo(w, h - r)
+        path.quadTo(w, h, w - r, h)
+        path.lineTo(r, h)
+        path.quadTo(0, h, 0, h - r)
+        path.closeSubpath()
+
+        # Translucent fill (higher transparency than the card)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(SPOT_GLASS_BASE))
+        painter.drawPath(path)
+
+        # Visible thin border (Spotlight-style)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(SPOT_GLASS_BORDER, 1.0))
+        painter.drawPath(path)
+        painter.end()
+
+    # ── Status / send ────────────────────────────────────────────────────
+    def set_status(self, msg: str):
+        self.status_label.setText(msg)
+        if msg == "Ready":
+            self.input_box.setEnabled(True)
+            self.input_box.setPlaceholderText("Ask Halo\u2026")
+        else:
+            self.input_box.setPlaceholderText(msg)
+
+    def _on_send(self):
+        text = self.input_box.text().strip()
+        if not text:
+            return
+        self.input_box.clear()
+        self.input_box.clearFocus()
+        self.set_status("Thinking\u2026")
+        self._collapse()
+        self.user_submitted.emit(text)
+
+
+# --- Response Card (cursor-dodging) ------------------------------------------
+class ResponseCard(QWidget):
+    """
+    Always-visible reply card that dodges the mouse cursor.
+    Sits near a screen edge and smoothly slides to the opposite side
+    whenever the cursor approaches, so it never blocks the user's clicks.
+    Aliased as ChatPanel for backward-compat.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._build_ui()
+        self._setup_positions()
+        self._start_dodge_timer()
+
+    def _build_ui(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents) 
+        self.setFixedSize(CARD_W, CARD_MIN_H)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 2)
+        shadow.setColor(QColor(0, 0, 0, 80))
+        self.setGraphicsEffect(shadow)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 18, 12)
+        root.setSpacing(6)
+
+        self.history = QTextEdit()
+        self.history.setReadOnly(True)
+        self.history.setFont(QFont(FONT_FAMILY, 11))
+        self.history.setStyleSheet("""
+            QTextEdit {
+                background: transparent;
+                color: rgba(255, 255, 255, 230);
+                border: none;
+                padding: 0px 4px;
+                selection-background-color: rgba(255, 255, 255, 30);
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 4px;
+                margin: 4px 0;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 35);
+                border-radius: 2px;
+                min-height: 20px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+        """)
+        root.addWidget(self.history, stretch=1)
+
+        self.status_label = QLabel("Ready")
+        self.status_label.setFont(QFont(FONT_FAMILY, 9))
+        self.status_label.setStyleSheet("color: rgba(255, 255, 255, 100);")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(self.status_label)
+
+    # -- Positioning -----------------------------------------------------------
+    def _setup_positions(self):
+        """Precompute left / right resting positions (vertically centred)."""
+        screen = QApplication.primaryScreen().geometry()
+        self._card_y = (screen.height() - CARD_MIN_H) // 2
+        self._pos_right = QPoint(screen.width() - CARD_W - CARD_MARGIN, self._card_y)
+        self._pos_left  = QPoint(CARD_MARGIN, self._card_y)
+        self._on_right = True      # start on the right
+        self.move(self._pos_right)
+
+        self._anim = QPropertyAnimation(self, b"pos")
+        self._anim.setDuration(350)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    # -- Cursor dodge timer ----------------------------------------------------
+    def _start_dodge_timer(self):
+        self._dodge_timer = QTimer(self)
+        self._dodge_timer.setInterval(120)   # check ~8 times/sec
+        self._dodge_timer.timeout.connect(self._check_cursor)
+        self._dodge_timer.start()
+
+    def _check_cursor(self):
+        """If the cursor is within the padded card rect, slide to the other side."""
+        if self._anim.state() == QPropertyAnimation.State.Running:
+            return  # don't interrupt an ongoing slide
+
+        cursor = QCursor.pos()
+        geo = self.geometry()
+        padded = geo.adjusted(-CARD_DODGE_PAD, -CARD_DODGE_PAD,
+                              CARD_DODGE_PAD, CARD_DODGE_PAD)
+
+        if padded.contains(cursor):
+            # Dodge to the opposite side
+            if self._on_right:
+                self._slide_to(self._pos_left)
+                self._on_right = False
+            else:
+                self._slide_to(self._pos_right)
+                self._on_right = True
+
+    def _slide_to(self, target: QPoint):
+        self._anim.stop()
+        self._anim.setStartValue(self.pos())
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    # -- Paint: rounded rect ---------------------------------------------------
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = float(self.width()), float(self.height())
+        r = 12.0
+
+        body = QPainterPath()
+        body.addRoundedRect(0.0, 0.0, w, h, r, r)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(SPOT_GLASS_BASE))
+        painter.drawPath(body)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(SPOT_GLASS_BORDER, 1.0))
+        painter.drawPath(body)
+        painter.end()
+
+    def append_message(self, sender: str, text: str, color: str = "rgba(255,255,255,0.90)"):
+        sender_color = "rgba(255,255,255,0.50)" if sender == "Halo" else "rgba(255,255,255,0.35)"
+        self.history.append(
+            f'<span style="color:{sender_color};font-size:9pt;font-weight:600;">{sender}</span><br>'
+            f'<span style="color:{color};font-size:11pt;">{text}</span><br>'
+        )
+
+    def set_status(self, msg: str):
+        self.status_label.setText(msg)
+
+
+ChatPanel = ResponseCard
+
+
+# ─── Top-Level Application Controller ────────────────────────────────────────
+class HaloApp:
+    """
+    Owns and wires OverlayWindow + SpotlightBar + ResponseCard + AIWorker.
+    self.chat is an alias for self.card (ResponseCard) for backward-compat.
+    Lifecycle: instantiate, then call .start().
+    """
+
+    def __init__(self):
+        self.overlay = OverlayWindow()
+        self.bar     = SpotlightBar()     # self-positions at top-centre
+        self.card    = ResponseCard()     # self-positions at right edge
+        self.chat    = self.card           # backward-compat alias
+        self._worker: AIWorker | None = None
+
+        self.bar.user_submitted.connect(self._on_user_prompt)
+
+    def start(self):
+        self.overlay.show()
+        self.bar.show()
+        self.card.show()
+        self.card.append_message(
+            "Halo",
+            "Hello! I'm here to help you navigate. What do you need?",
+        )
+
+    # ── Private ──────────────────────────────────────────────────────────────
+    def _on_user_prompt(self, prompt: str):
+        """Capture screen \u2192 hand off to worker thread."""
+        self._capture_screenshot()
+        self._worker = AIWorker(SCREENSHOT_PATH, prompt)
+        self._worker.result_ready.connect(self._on_result)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+    def _capture_screenshot(self):
+        """Take a full-screen screenshot and save to SCREENSHOT_PATH."""
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            sct.shot(mon=1, output=SCREENSHOT_PATH)
+
+    def _on_result(self, result: dict):
+        if result.get("status") == "success":
+            self.overlay.show_highlight(
+                result["x"], result["y"],
+                result["width"], result["height"],
+            )
+            self.card.append_message("Halo", result["message"], "rgba(48,209,88,0.75)")
+            self.bar.set_status("Tap the highlighted area")
+            self.card.set_status("Tap the highlighted area")
+        else:
+            msg = result.get("message", "Something went wrong. Please try again.")
+            self.card.append_message("Halo", msg, "rgba(255,69,58,0.75)")
+            self.bar.set_status("Ready")
+            self.card.set_status("Ready")
+
+    def _on_error(self, error_msg: str):
+        self.card.append_message("Halo", f"[Error] {error_msg}", "rgba(255,69,58,0.75)")
+        self.bar.set_status("Ready")
+        self.card.set_status("Ready")
+
+
+# ─── Entry Point ──────────────────────────────────────────────────────────────
+def main():
+    # Allow Ctrl+C in the terminal to kill the process cleanly
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Halo")
+    app.setWindowIcon(QIcon(str(_ICON_PATH)))
+
+    halo = HaloApp()
+    halo.start()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

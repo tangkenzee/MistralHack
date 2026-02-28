@@ -3,7 +3,7 @@ name: ssot
 description: use this as context for what our app actually does and its goals
 ---
 
-# Single Source of Truth (SSOT): Project "ClearPath"
+# Single Source of Truth (SSOT): Project "Halo"
 
 ## 1. The Narrative & Scope
 

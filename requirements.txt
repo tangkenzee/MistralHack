@@ -1,0 +1,9 @@
+# Halo dependencies
+PyQt6>=6.6.0
+mss>=9.0.1
+opencv-python>=4.9.0
+mistralai>=1.0.0
+
+# Testing
+pytest>=8.0.0
+pytest-qt>=4.4.0
