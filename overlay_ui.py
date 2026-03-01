@@ -49,6 +49,7 @@ from PyQt6.QtWidgets import (
 import ai_brain
 from ai_brain import Session
 from ai_brain.speech_to_text import realtime_transcribe
+from ai_brain.text_to_speech import speak, stop_speaking
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 _ROOT      = Path(__file__).parent
@@ -208,6 +209,38 @@ class RealtimeSTTWorker(QThread):
         """Ask the microphone iterator to finish (called from the main thread)."""
         if self._stop_event is not None and self._loop is not None:
             self._loop.call_soon_threadsafe(self._stop_event.set)
+
+
+# ─── TTS Worker Thread ──────────────────────────────────────────────────────
+class TTSWorker(QThread):
+    """
+    Runs ElevenLabs text-to-speech in a background thread.
+    Streams audio playback so the UI stays responsive.
+
+    Signals:
+        started_speaking()  – playback has begun
+        finished_speaking() – playback completed or was interrupted
+        error(str)          – something went wrong
+    """
+    started_speaking  = pyqtSignal()
+    finished_speaking = pyqtSignal()
+    error             = pyqtSignal(str)
+
+    def __init__(self, text: str):
+        super().__init__()
+        self._text = text
+
+    def run(self):
+        speak(
+            self._text,
+            on_start=lambda: self.started_speaking.emit(),
+            on_done=lambda: self.finished_speaking.emit(),
+            on_error=lambda msg: self.error.emit(msg),
+        )
+
+    def request_stop(self):
+        """Interrupt playback as soon as possible."""
+        stop_speaking()
 
 
 # ─── Full-Screen Overlay (paint-only, click-through) ─────────────────────────
@@ -1046,6 +1079,9 @@ class HaloApp(QObject):
         self._bridge.send_pressed.connect(self._hotkey_send)
         self._bridge.reset_pressed.connect(self._hotkey_reset)
 
+        # TTS state
+        self._tts_worker: TTSWorker | None = None
+
         self.bar.user_submitted.connect(self._on_user_prompt)
 
     def start(self):
@@ -1094,6 +1130,7 @@ class HaloApp(QObject):
 
     def _hotkey_reset(self):
         """Alt+R — discard the current session and clear all highlights."""
+        self._stop_tts()              # stop any voice playback
         self._session         = Session()
         self._session_started = False
         self.overlay.clear_highlight()
@@ -1103,6 +1140,7 @@ class HaloApp(QObject):
 
     def _run_worker(self, screenshot_path: str, prompt: str | None):
         """Spin up an AIWorker for one pipeline step."""
+        self._stop_tts()              # interrupt voice if still speaking
         self._capture_screenshot()
         self._worker = AIWorker(screenshot_path, prompt, session=self._session)
         self._worker.result_ready.connect(self._on_result)
@@ -1127,6 +1165,8 @@ class HaloApp(QObject):
             self.card.append_message("Halo", result["message"])
             self.bar.set_status("Press Alt+N after acting")
             self.card.set_status("Press Alt+N after acting")
+            # Read the response aloud via ElevenLabs TTS
+            self._speak(result["message"])
         else:
             msg = result.get("message", "Something went wrong. Please try again.")
             self.card.append_message("Halo", msg, "rgba(255,69,58,0.75)")
@@ -1137,6 +1177,30 @@ class HaloApp(QObject):
         self.card.append_message("Halo", f"[Error] {error_msg}", "rgba(255,69,58,0.75)")
         self.bar.set_status("Ready")
         self.card.set_status("Ready")
+
+    # ── TTS helpers ──────────────────────────────────────────────────────
+    def _speak(self, text: str):
+        """Start TTS playback in a background thread."""
+        self._stop_tts()          # cancel any in-flight playback first
+        self._tts_worker = TTSWorker(text)
+        self._tts_worker.started_speaking.connect(self._on_tts_started)
+        self._tts_worker.finished_speaking.connect(self._on_tts_finished)
+        self._tts_worker.error.connect(self._on_tts_error)
+        self._tts_worker.start()
+
+    def _stop_tts(self):
+        """Interrupt any running TTS playback."""
+        if self._tts_worker is not None and self._tts_worker.isRunning():
+            self._tts_worker.request_stop()
+
+    def _on_tts_started(self):
+        print("  🔊 TTS speaking…")
+
+    def _on_tts_finished(self):
+        print("  🔊 TTS done.")
+
+    def _on_tts_error(self, msg: str):
+        print(f"  ❌ TTS Error: {msg}")
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────

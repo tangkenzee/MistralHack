@@ -1,0 +1,41 @@
+{
+    "_comment": "ElevenLabs TTS configuration for Halo (Project ClearPath)",
+    "_docs": "https://elevenlabs.io/docs/api-reference/text-to-speech/convert",
+
+    "api_key_env": "ELEVENLABS_API_KEY",
+
+    "voice_id": "dIeHOwebB4fO6l6gNfUK",
+    "_voice_id_note": "https://elevenlabs.io/app/voice-library?voiceId=dIeHOwebB4fO6l6gNfUK",
+
+    "model_id": "eleven_flash_v2_5",
+    "_model_id_note": "Options: eleven_v3 (best quality), eleven_multilingual_v2 (29 languages, stable), eleven_flash_v2_5 (ultra-low latency, 50% cheaper), eleven_turbo_v2_5 (balanced)",
+
+    "output_format": "mp3_44100_128",
+    "_output_format_note": "Options: mp3_22050_32, mp3_44100_64, mp3_44100_96, mp3_44100_128, mp3_44100_192, pcm_16000, pcm_22050, pcm_24000, pcm_44100",
+
+    "voice_settings": {
+        "stability": 0.6,
+        "_stability_note": "Range 0.0–1.0. Lower = more expressive/variable, Higher = more consistent/monotone. 0.5–0.7 is warm and natural.",
+
+        "similarity_boost": 0.8,
+        "_similarity_boost_note": "Range 0.0–1.0. How closely the AI sticks to the original voice. Higher = closer to the voice sample, lower = more variation.",
+
+        "style": 0.35,
+        "_style_note": "Range 0.0–1.0. Amplifies the style of the original speaker. Higher = more dramatic/expressive. Keep below 0.5 for calm, approachable tone. Set to 0.0 to disable.",
+
+        "speed": 1.0,
+        "_speed_note": "Range 0.5–2.0. Speaking rate multiplier. 1.0 = normal. Below 1.0 = slower (gentler for elderly users). Above 1.0 = faster.",
+
+        "use_speaker_boost": true,
+        "_use_speaker_boost_note": "Boosts similarity to the original speaker. Increases latency slightly but improves voice quality."
+    },
+
+    "apply_text_normalization": "auto",
+    "_apply_text_normalization_note": "Options: auto, on, off. 'auto' lets the model decide (e.g. spelling out numbers). 'on' forces it. 'off' skips it.",
+
+    "seed": null,
+    "_seed_note": "Integer 0–4294967295 or null. Set a fixed seed for reproducible output. null = random each time.",
+
+    "ffplay_dir": "C:\\Users\\Jason\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.0.1-full_build\\bin",
+    "_ffplay_dir_note": "Directory containing ffplay.exe. Added to PATH at runtime so ElevenLabs can find it regardless of which terminal launches the app. Set to null to skip."
+}
