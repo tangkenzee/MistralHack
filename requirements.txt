@@ -4,6 +4,7 @@ mss
 opencv-python
 numpy
 mistralai
+google-genai
 python-dotenv
 keyboard
 

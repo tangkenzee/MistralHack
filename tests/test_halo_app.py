@@ -133,7 +133,7 @@ class TestOnResultSuccess:
 
     def test_updates_status_to_done(self, app, success_payload):
         app._on_result(success_payload)
-        assert "Tap" in app.chat.status_label.text()
+        assert "Alt+N" in app.chat.status_label.text()
 
     def test_highlight_coordinates_are_exact(self, app, success_payload):
         app._on_result(success_payload)
@@ -220,32 +220,34 @@ class TestCaptureScreenshot:
 
 class TestOnUserPrompt:
     def test_creates_ai_worker(self, app):
+        from overlay_ui import AIWorker
         mock_sct = MagicMock()
         mock_sct.monitors = [{}, {}]
 
         with patch("overlay_ui.mss.mss", return_value=mock_sct):
-            with patch("overlay_ui.ai_brain.get_target_coordinates"):
+            with patch.object(AIWorker, "start"):   # prevent real thread launch
                 app._on_user_prompt("test prompt")
 
-        from overlay_ui import AIWorker
         assert isinstance(app._worker, AIWorker)
 
     def test_worker_receives_correct_prompt(self, app):
+        from overlay_ui import AIWorker
         mock_sct = MagicMock()
         mock_sct.monitors = [{}, {}]
 
         with patch("overlay_ui.mss.mss", return_value=mock_sct):
-            with patch("overlay_ui.ai_brain.get_target_coordinates"):
+            with patch.object(AIWorker, "start"):
                 app._on_user_prompt("where is the login button?")
 
         assert app._worker.user_prompt == "where is the login button?"
 
     def test_worker_receives_screenshot_path(self, app):
+        from overlay_ui import AIWorker
         mock_sct = MagicMock()
         mock_sct.monitors = [{}, {}]
 
         with patch("overlay_ui.mss.mss", return_value=mock_sct):
-            with patch("overlay_ui.ai_brain.get_target_coordinates"):
+            with patch.object(AIWorker, "start"):
                 app._on_user_prompt("help")
 
         assert app._worker.screenshot_path == SCREENSHOT_PATH

@@ -1,11 +1,15 @@
 """
 mistral_label.py
 ────────────────
-Reasoning Engine: Mistral AI VLM integration for UI element analysis.
+Reasoning Engine: VLM integration for UI element analysis.
+
+Supports two providers (chosen via .env):
+  • Mistral — default provider
+  • Gemini  — used only when AI_PROVIDER=gemini is set in .env
 
 Responsibilities:
   - Encode annotated screenshots to base64
-  - Send images + user prompts to Mistral VLM API
+  - Send images + user prompts to the chosen VLM API
   - Parse structured JSON responses
   - Two modes:
       1. label_elements()  — enumerate/describe ALL numbered boxes
@@ -17,8 +21,32 @@ import os
 import re
 import json
 import base64
-from dotenv import load_dotenv
-from mistralai import Mistral
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed — parse .env manually
+    import pathlib
+    _env_path = pathlib.Path(__file__).parent.parent / ".env"
+    if _env_path.exists():
+        for _line in _env_path.read_text().splitlines():
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+# ── Provider SDKs (imported lazily; only the active one is needed) ────────────
+try:
+    from mistralai import Mistral
+except ImportError:
+    Mistral = None
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:
+    genai = None
+    genai_types = None
 
 # import prompt.txt to replace the TARGET system prompt
 _PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt.txt")
@@ -26,18 +54,26 @@ with open(_PROMPT_PATH, "r") as f:
     TARGET_SYSTEM_PROMPT = f.read()
 
 # ── Load environment ──────────────────────────────────────────────────────────
-load_dotenv()
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+GOOGLE_API_KEY  = os.getenv("GOOGLE_API_KEY", "")
+
+# Determine which provider to use: Mistral by default, Gemini only if explicitly set
+_provider_override = os.getenv("AI_PROVIDER", "").lower().strip()
+if _provider_override == "gemini" and GOOGLE_API_KEY:
+    AI_PROVIDER = "gemini"
+else:
+    AI_PROVIDER = "mistral"
+
+print(f"[BRAIN] AI provider: {AI_PROVIDER}")
 
 # ── Model Configuration ──────────────────────────────────────────────────────
-#  Centralised config for the Mistral API calls.
-#    • temperature : low (0.1) for deterministic, reliable UI-navigation answers
-#    • response_format : force the model to return valid JSON natively
-MODEL_CONFIG = {
+MISTRAL_MODEL_CONFIG = {
     "model": "mistral-small-latest",
     "temperature": 0.2,
     "response_format": {"type": "json_object"},
 }
+
+GEMINI_MODEL = "gemini-2.0-flash"
 
 
 # ── System Prompts ────────────────────────────────────────────────────────────
@@ -111,28 +147,89 @@ def _parse_json(raw: str):
 
 
 def _check_api_key() -> bool:
-    """Return True if a valid-looking API key is configured."""
-    if not MISTRAL_API_KEY or MISTRAL_API_KEY == "your_mistral_api_key_here":
-        print("  ⚠ MISTRAL_API_KEY not set — skipping Mistral call.")
-        return False
+    """Return True if a valid-looking API key is configured for the active provider."""
+    if AI_PROVIDER == "gemini":
+        if not GOOGLE_API_KEY:
+            print("  ⚠ GOOGLE_API_KEY not set — skipping Gemini call.")
+            return False
+    else:
+        if not MISTRAL_API_KEY or MISTRAL_API_KEY == "your_mistral_api_key_here":
+            print("  ⚠ MISTRAL_API_KEY not set — skipping Mistral call.")
+            return False
     return True
 
 
-# ── Core Mistral Call (shared by one-shot & session modes) ────────────────────
+# ── Core LLM Call (shared by one-shot & session modes) ────────────────────────
 
-def _call_mistral(messages: list[dict]) -> str:
-    """Send a full messages list to Mistral and return the raw response text.
+def _call_gemini(messages: list[dict]) -> str:
+    """Convert OpenAI-style messages to Gemini SDK calls and return response text."""
+    if genai is None:
+        print("  ⚠ google-genai not installed.")
+        return ""
 
-    This is the single point of contact with the Mistral API, used by both
-    the one-shot functions (label_elements / find_target_box) and by the
-    multi-step Session class.
-    """
-    if not _check_api_key():
+    client = genai.Client(api_key=GOOGLE_API_KEY)
+
+    # Extract system prompt from messages
+    system_prompt = ""
+    conversation_parts = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_prompt = msg["content"] if isinstance(msg["content"], str) else str(msg["content"])
+        else:
+            content = msg["content"]
+            if isinstance(content, str):
+                conversation_parts.append(genai_types.Part.from_text(text=content))
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") == "text":
+                            conversation_parts.append(genai_types.Part.from_text(text=part["text"]))
+                        elif part.get("type") == "image_url":
+                            url = part.get("image_url", "")
+                            if isinstance(url, str) and url.startswith("data:"):
+                                header, b64data = url.split(",", 1)
+                                mime = header.split(";")[0].split(":")[1]
+                                img_bytes = base64.b64decode(b64data)
+                                conversation_parts.append(
+                                    genai_types.Part.from_bytes(data=img_bytes, mime_type=mime)
+                                )
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=conversation_parts,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=system_prompt if system_prompt else None,
+            temperature=0.2,
+            response_mime_type="application/json",
+        ),
+    )
+    return response.text.strip()
+
+
+def _call_mistral_api(messages: list[dict]) -> str:
+    """Send a full messages list to Mistral and return the raw response text."""
+    if Mistral is None:
+        print("  ⚠ mistralai not installed.")
         return ""
 
     client = Mistral(api_key=MISTRAL_API_KEY)
-    response = client.chat.complete(**MODEL_CONFIG, messages=messages)
+    response = client.chat.complete(**MISTRAL_MODEL_CONFIG, messages=messages)
     return response.choices[0].message.content.strip()
+
+
+def _call_llm(messages: list[dict]) -> str:
+    """Route to the active provider. This is the single point of contact used
+    by both one-shot functions and the multi-step Session class."""
+    if not _check_api_key():
+        return ""
+
+    if AI_PROVIDER == "gemini":
+        return _call_gemini(messages)
+    return _call_mistral_api(messages)
+
+
+# Keep backward-compat alias so session.py import doesn't break
+_call_mistral = _call_llm
 
 
 # ── Public Functions ──────────────────────────────────────────────────────────
@@ -145,7 +242,7 @@ def label_elements(marked_image_path: str) -> list:
     Returns a list of dicts:
       [{ "box_id": 1, "type": "button", "text_content": "Submit", "purpose": "..." }, ...]
     """
-    print("[BRAIN] Sending annotated image to Mistral AI for labeling …")
+    print(f"[BRAIN] Sending annotated image to {AI_PROVIDER} for labeling …")
 
     image_b64 = _encode_image_base64(marked_image_path)
 
@@ -166,15 +263,15 @@ def label_elements(marked_image_path: str) -> list:
         },
     ]
 
-    raw = _call_mistral(messages)
+    raw = _call_llm(messages)
     if not raw:
         return []
 
-    print(f"  ✔ Mistral responded ({len(raw)} chars)")
+    print(f"  \u2714 {AI_PROVIDER} responded ({len(raw)} chars)")
 
     labels = _parse_json(raw)
     if labels is None:
-        print("  ⚠ Could not parse Mistral response as JSON.")
+        print(f"  ⚠ Could not parse {AI_PROVIDER} response as JSON.")
         print(f"  Raw response:\n{raw}")
         return []
 
@@ -196,7 +293,7 @@ def find_target_box(marked_image_path: str, user_prompt: str, raw_image_path: st
     Or on failure:
       { "box_id": None, "message": "Sorry, I could not find …" }
     """
-    print("[BRAIN] Asking Mistral AI which element to click …")
+    print(f"[BRAIN] Asking {AI_PROVIDER} which element to click …")
 
     marked_b64 = _encode_image_base64(marked_image_path)
 
@@ -227,15 +324,15 @@ def find_target_box(marked_image_path: str, user_prompt: str, raw_image_path: st
         },
     ]
 
-    raw = _call_mistral(messages)
+    raw = _call_llm(messages)
     if not raw:
         return {"box_id": None, "message": "API key not configured."}
 
-    print(f"  ✔ Mistral responded ({len(raw)} chars)")
+    print(f"  \u2714 {AI_PROVIDER} responded ({len(raw)} chars)")
 
     result = _parse_json(raw)
     if result is None:
-        print("  ⚠ Could not parse Mistral response as JSON.")
+        print(f"  ⚠ Could not parse {AI_PROVIDER} response as JSON.")
         print(f"  Raw response:\n{raw}")
         return {"box_id": None, "message": "Failed to parse AI response."}
 

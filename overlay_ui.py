@@ -3,15 +3,20 @@ Halo - overlay_ui.py
 ====================
 The "Glass" layer: a transparent, frameless, always-on-top PyQt6 overlay
 with a spotlight input bar and cursor-dodging response card.
-Delegates all AI/vision work to ai_brain.py via AIWorker (QThread)
+Delegates all AI/vision work to the ai_brain package via AIWorker (QThread)
 so the UI never blocks.
 
 Architecture:
   OverlayWindow  – full-screen, click-through, paints dim scrim + clear cutout.
   SpotlightBar   – iPhone-notch-style input bar fused to top-centre of screen.
   ResponseCard   – always-visible reply card that dodges the cursor.
-  AIWorker       – background thread that calls ai_brain.get_target_coordinates.
-  HaloApp        – top-level wiring that owns all windows.
+  AIWorker       – background thread; wraps ai_brain one-shot or Session step.
+  _HotkeyBridge  – QObject that relays keyboard hotkeys to the Qt main thread.
+  HaloApp        – top-level wiring that owns all windows + the active Session.
+
+Global hotkeys (work even when the overlay has no keyboard focus):
+  Alt+N  – take a screenshot and advance the AI session (repeat after each action)
+  Alt+R  – reset the session and clear the highlight
 """
 
 import sys
@@ -21,8 +26,12 @@ import ctypes
 import random
 from pathlib import Path
 import mss
+try:
+    import keyboard
+except ImportError:
+    keyboard = None  # hotkeys disabled when package unavailable (e.g. CI)
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QRect, QPoint, QRectF,
+    Qt, QThread, QObject, pyqtSignal, QRect, QPoint, QRectF,
     QPropertyAnimation, QEasingCurve, QEvent, pyqtProperty, QTimer,
 )
 from PyQt6.QtGui import (
@@ -36,6 +45,7 @@ from PyQt6.QtWidgets import (
 )
 
 import ai_brain
+from ai_brain import Session
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 _ROOT      = Path(__file__).parent
@@ -102,24 +112,36 @@ def _exclude_from_capture(widget):
 # ─── Worker Thread ────────────────────────────────────────────────────────────
 class AIWorker(QThread):
     """
-    Runs ai_brain.get_target_coordinates in a background thread.
-    Emits `result_ready` with the returned dict when done,
+    Runs ai_brain logic in a background thread so the UI never blocks.
+
+    Two modes:
+      • session mode  – pass a Session object; calls session.next_step() so
+                        conversation history is preserved across steps.
+      • one-shot mode – no session; calls ai_brain.get_target_coordinates()
+                        (used by unit tests and legacy code paths).
+
+    Emits `result_ready` with the SSOT-guaranteed dict when done,
     or `error` with a message string on failure.
     """
     result_ready = pyqtSignal(dict)
     error        = pyqtSignal(str)
 
-    def __init__(self, screenshot_path: str, user_prompt: str):
+    def __init__(self, screenshot_path: str, user_prompt: str | None = None,
+                 session: Session | None = None):
         super().__init__()
         self.screenshot_path = screenshot_path
         self.user_prompt     = user_prompt
+        self.session         = session
 
     def run(self):
         try:
-            result = ai_brain.get_target_coordinates(
-                self.screenshot_path,
-                self.user_prompt,
-            )
+            if self.session is not None:
+                result = self.session.next_step(self.screenshot_path, self.user_prompt)
+            else:
+                result = ai_brain.get_target_coordinates(
+                    self.screenshot_path,
+                    self.user_prompt,
+                )
             self.result_ready.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -148,6 +170,7 @@ class OverlayWindow(QWidget):
         super().__init__()
         self._highlight: QRect | None = None
         self._pulse = 0.0
+        self._exclude_widgets: list[QWidget] = []  # widgets exempt from dim
 
         self._pulse_anim = QPropertyAnimation(self, b"pulse_phase", self)
         self._pulse_anim.setDuration(PULSE_DURATION)
@@ -172,9 +195,19 @@ class OverlayWindow(QWidget):
 
     # ── Public API ──────────────────────────────────────────────────────────
     def show_highlight(self, x: int, y: int, width: int, height: int):
-        self._highlight = QRect(x, y, width, height)
+        # OpenCV coordinates are in physical (mss) pixels; scale to Qt logical
+        dpr = QApplication.primaryScreen().devicePixelRatio()
+        lx = int(x / dpr)
+        ly = int(y / dpr)
+        lw = int(width / dpr)
+        lh = int(height / dpr)
+        print(f"[OVERLAY] show_highlight  raw=({x},{y},{width},{height})  "
+              f"dpr={dpr}  logical=({lx},{ly},{lw},{lh})  "
+              f"overlay_geom={self.geometry()}  visible={self.isVisible()}")
+        self._highlight = QRect(lx, ly, lw, lh)
         self._pulse_anim.start()
-        self.update()
+        self.raise_()
+        self.repaint()
 
     def clear_highlight(self):
         self._highlight = None
@@ -201,6 +234,14 @@ class OverlayWindow(QWidget):
         cutout = QPainterPath()
         cutout.addRoundedRect(QRectF(rect), r, r)
         dimmed = full - cutout
+
+        # 2b) Also subtract any registered UI widgets (bar, card) so they
+        #     appear above the dim scrim without being darkened.
+        for w in self._exclude_widgets:
+            if w.isVisible():
+                wcut = QPainterPath()
+                wcut.addRoundedRect(QRectF(w.geometry()), r, r)
+                dimmed = dimmed - wcut
 
         # 3) Fill the dimmed region
         painter.setPen(Qt.PenStyle.NoPen)
@@ -746,20 +787,53 @@ class ResponseCard(QWidget):
 ChatPanel = ResponseCard
 
 
+# ─── Hotkey Bridge ────────────────────────────────────────────────────────────
+class _HotkeyBridge(QObject):
+    """
+    Thin QObject used to relay global keyboard hotkey events (which fire on a
+    background thread) safely into the Qt main thread via queued signals.
+    """
+    send_pressed  = pyqtSignal()   # Alt+N — advance / start session
+    reset_pressed = pyqtSignal()   # Alt+R — reset session
+
+
 # ─── Top-Level Application Controller ────────────────────────────────────────
-class HaloApp:
+class HaloApp(QObject):
     """
     Owns and wires OverlayWindow + SpotlightBar + ResponseCard + AIWorker.
+
+    Inherits QObject so that signal connections from AIWorker (a QThread) are
+    automatically queued onto the main thread — required for safe GUI updates.
+
+    Session flow (per SSOT §3):
+      1. User types a prompt and presses Enter (or Alt+N) → first step.
+      2. User acts on the highlighted element, then presses Alt+N → next step
+         (no new prompt; Session memory carries context forward).
+      3. Alt+R resets the session and clears the highlight.
+
     self.chat is an alias for self.card (ResponseCard) for backward-compat.
     Lifecycle: instantiate, then call .start().
     """
 
     def __init__(self):
+        super().__init__()
         self.overlay = OverlayWindow()
         self.bar     = SpotlightBar()     # self-positions at top-centre
         self.card    = ResponseCard()     # self-positions at right edge
         self.chat    = self.card           # backward-compat alias
         self._worker: AIWorker | None = None
+
+        # Tell overlay not to dim over the bar and card
+        self.overlay._exclude_widgets = [self.bar, self.card]
+
+        # Session state
+        self._session         = Session()
+        self._session_started = False     # True after the first step is fired
+
+        # Hotkey bridge (routes keyboard thread → Qt main thread)
+        self._bridge = _HotkeyBridge()
+        self._bridge.send_pressed.connect(self._hotkey_send)
+        self._bridge.reset_pressed.connect(self._hotkey_reset)
 
         self.bar.user_submitted.connect(self._on_user_prompt)
 
@@ -772,14 +846,54 @@ class HaloApp:
         self.card.raise_()
         self.card.append_message(
             "Halo",
-            "Hello! I'm here to help you navigate. What do you need?",
+            "Hello! I'm here to help you navigate. What do you need?\n\n"
+            "Tip: press Alt+N after each action to continue.",
         )
+
+        # Register global hotkeys (silently skipped in headless/non-admin envs)
+        try:
+            keyboard.add_hotkey("alt+n", self._bridge.send_pressed.emit, suppress=True)
+            keyboard.add_hotkey("alt+r", self._bridge.reset_pressed.emit, suppress=True)
+        except Exception:
+            pass
 
     # ── Private ──────────────────────────────────────────────────────────────
     def _on_user_prompt(self, prompt: str):
-        """Capture screen \u2192 hand off to worker thread."""
+        """Enter/submit from SpotlightBar — begins (or restarts) a session."""
+        self._session_started = True
+        self._run_worker(SCREENSHOT_PATH, prompt)
+
+    def _hotkey_send(self):
+        """Alt+N — advance the session (or start it using the bar's text)."""
+        if self._worker and self._worker.isRunning():
+            return   # still processing previous step
+
+        if not self._session_started:
+            # Grab whatever text is in the input bar and submit it
+            text = self.bar.input_box.text().strip()
+            if text:
+                self.bar._on_send()  # triggers _on_user_prompt via signal
+            return
+
+        # Auto-continue: no new prompt — Session memory provides context
+        self.bar.set_status("Thinking…")
+        self.card.set_status("Thinking…")
         self._capture_screenshot()
-        self._worker = AIWorker(SCREENSHOT_PATH, prompt)
+        self._run_worker(SCREENSHOT_PATH, None)
+
+    def _hotkey_reset(self):
+        """Alt+R — discard the current session and clear all highlights."""
+        self._session         = Session()
+        self._session_started = False
+        self.overlay.clear_highlight()
+        self.bar.set_status("Ready")
+        self.card.set_status("Ready")
+        self.card.append_message("Halo", "Session reset. What would you like to do?")
+
+    def _run_worker(self, screenshot_path: str, prompt: str | None):
+        """Spin up an AIWorker for one pipeline step."""
+        self._capture_screenshot()
+        self._worker = AIWorker(screenshot_path, prompt, session=self._session)
         self._worker.result_ready.connect(self._on_result)
         self._worker.error.connect(self._on_error)
         self._worker.start()
@@ -787,18 +901,21 @@ class HaloApp:
     def _capture_screenshot(self):
         """Take a full-screen screenshot and save to SCREENSHOT_PATH."""
         with mss.mss() as sct:
-            monitor = sct.monitors[1]
             sct.shot(mon=1, output=SCREENSHOT_PATH)
 
     def _on_result(self, result: dict):
+        import threading
+        print(f"[HALO] _on_result called on thread={threading.current_thread().name}  "
+              f"status={result.get('status')}  coords=({result.get('x')},{result.get('y')},"
+              f"{result.get('width')},{result.get('height')})")
         if result.get("status") == "success":
             self.overlay.show_highlight(
                 result["x"], result["y"],
                 result["width"], result["height"],
             )
             self.card.append_message("Halo", result["message"])
-            self.bar.set_status("Tap the highlighted area")
-            self.card.set_status("Tap the highlighted area")
+            self.bar.set_status("Press Alt+N after acting")
+            self.card.set_status("Press Alt+N after acting")
         else:
             msg = result.get("message", "Something went wrong. Please try again.")
             self.card.append_message("Halo", msg, "rgba(255,69,58,0.75)")
