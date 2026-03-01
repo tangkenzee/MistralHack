@@ -22,6 +22,7 @@ Global hotkeys (work even when the overlay has no keyboard focus):
 import sys
 import math
 import signal
+import os
 import ctypes
 import random
 from pathlib import Path
@@ -95,11 +96,18 @@ SCREENSHOT_PATH   = "images/raw.png"
 # all capture APIs (mss, PrintScreen, OBS, etc.).
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
+# When True (default), the overlay is hidden from screenshots / screen-capture.
+# Set HIDE_OVERLAY=false in .env to include the overlay in captures.
+_HIDE_OVERLAY = os.getenv("HIDE_OVERLAY", "true").strip().lower() in ("true", "1", "yes")
+
 def _exclude_from_capture(widget):
     """Mark *widget* invisible to screenshot / screen-capture tools.
     Uses SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE).  Requires the
     native HWND, so we call winId() first (creates it if needed).
+    Controlled by HIDE_OVERLAY env flag (default: true).
     Silently ignored on non-Windows or older builds."""
+    if not _HIDE_OVERLAY:
+        return
     if sys.platform != "win32":
         return
     try:

@@ -71,7 +71,7 @@ MISTRAL_MODEL_CONFIG = {
     "response_format": {"type": "json_object"},
 }
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3-flash-preview"
 
 
 # ── System Prompts ────────────────────────────────────────────────────────────
