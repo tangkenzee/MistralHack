@@ -10,6 +10,7 @@ python-dotenv
 keyboard
 pyaudio
 elevenlabs
+mouse
 
 # Testing
 pytest>=8.0.0

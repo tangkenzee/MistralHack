@@ -37,18 +37,20 @@ MISTRAL_API_KEY=your_key_here
 python overlay_ui.py
 ```
 
-### Hotkeys
+### Controls
 
-| Key     | Action                                                             |
-| ------- | ------------------------------------------------------------------ |
-| `Alt+N` | Take a screenshot and run the AI pipeline (repeat after each step) |
-| `Alt+R` | Reset the session and clear the highlight                          |
+A pill-shaped button sits on the right edge of the screen with two icons:
+
+| Button         | Action                                            |
+| -------------- | ------------------------------------------------- |
+| \u25b6 (play)  | Take a screenshot and advance to the next AI step |
+| \u21bb (reset) | Reset the session and clear the highlight         |
 
 **Typical flow:**
 1. Type your goal in the Spotlight bar (e.g. "I can't remember my password") and press Enter.
 2. Halo highlights the correct element. Take the suggested action.
-3. Press `Alt+N` — Halo sees the updated screen and guides you to the next step.
-4. Repeat until done. Press `Alt+R` to start a new task.
+3. Click the \u25b6 button on the right edge \u2014 Halo sees the updated screen and guides you to the next step.
+4. Repeat until done. Click \u21bb to start a new task.
 
 ## Test
 

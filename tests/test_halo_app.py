@@ -133,7 +133,7 @@ class TestOnResultSuccess:
 
     def test_updates_status_to_done(self, app, success_payload):
         app._on_result(success_payload)
-        assert "Alt+N" in app.chat.status_label.text()
+        assert "Act on" in app.chat.status_label.text() or "\u25b6" in app.chat.status_label.text()
 
     def test_highlight_coordinates_are_exact(self, app, success_payload):
         app._on_result(success_payload)

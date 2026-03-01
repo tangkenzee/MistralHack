@@ -11,12 +11,11 @@ Architecture:
   SpotlightBar   – iPhone-notch-style input bar fused to top-centre of screen.
   ResponseCard   – always-visible reply card that dodges the cursor.
   AIWorker       – background thread; wraps ai_brain one-shot or Session step.
-  _HotkeyBridge  – QObject that relays keyboard hotkeys to the Qt main thread.
+  ContinueButton – right-edge notch with Continue / Reset buttons.
   HaloApp        – top-level wiring that owns all windows + the active Session.
 
-Global hotkeys (work even when the overlay has no keyboard focus):
-  Alt+N  – take a screenshot and advance the AI session (repeat after each action)
-  Alt+R  – reset the session and clear the highlight
+A “Continue” pill on the right edge of the screen appears after each AI
+highlight and lets the user advance or reset the session with a click.
 """
 
 import sys
@@ -32,13 +31,17 @@ try:
     import keyboard
 except ImportError:
     keyboard = None  # hotkeys disabled when package unavailable (e.g. CI)
+try:
+    import mouse
+except ImportError:
+    mouse = None
 from PyQt6.QtCore import (
     Qt, QThread, QObject, pyqtSignal, QRect, QPoint, QRectF,
     QPropertyAnimation, QEasingCurve, QEvent, pyqtProperty, QTimer,
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QPen, QFont, QScreen, QIcon,
-    QBrush, QPainterPath, QPalette, QCursor,
+    QBrush, QPainterPath, QPalette, QCursor, QLinearGradient,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -92,6 +95,14 @@ TYPE_MIN_DELAY    = 15     # fastest tick (ms)
 TYPE_MAX_DELAY    = 55     # slowest tick (ms)
 TYPE_MIN_CHARS    = 1      # min chars revealed per tick
 TYPE_MAX_CHARS    = 3      # max chars revealed per tick
+
+# ── Continue-button (right-edge notch) ──
+CONTINUE_W        = 52       # pill width (narrow vertical strip)
+CONTINUE_H        = 140      # pill height
+CONTINUE_PEEK     = 14       # pixels visible when collapsed (notch)
+CONTINUE_BOUNCE_PX = 10
+CONTINUE_BOUNCE_MS = 800
+CONTINUE_BOUNCE_INT = 4000   # interval between bounces (ms)
 
 SCREENSHOT_PATH   = "images/raw.png"
 
@@ -1031,29 +1042,402 @@ class ResponseCard(QWidget):
 ChatPanel = ResponseCard
 
 
-# ─── Hotkey Bridge ────────────────────────────────────────────────────────────
-class _HotkeyBridge(QObject):
+# ─── Loading Indicator ────────────────────────────────────────────────────────
+class LoadingIndicator(QWidget):
     """
-    Thin QObject used to relay global keyboard hotkey events (which fire on a
-    background thread) safely into the Qt main thread via queued signals.
+    Full-screen loading overlay with a dark scrim, a horizontal shimmer
+    band that sweeps across the entire screen, and three pulsing dots in
+    a centred glass pill.  Shown while the AI worker is processing.
+    Uses QPropertyAnimation so translucent-window repaints stay alive.
     """
-    send_pressed  = pyqtSignal()   # Alt+N — advance / start session
-    reset_pressed = pyqtSignal()   # Alt+R — reset session
+
+    DOT_RADIUS     = 5.0
+    DOT_SPACING    = 22.0
+    DOT_CYCLE_MS   = 1400
+    SHIMMER_MS     = 2200      # slower sweep across full screen
+    SHIMMER_WIDTH  = 0.35      # shimmer band width as fraction of diagonal
+    SCRIM_COLOR    = QColor(0, 0, 0, 140)   # semi-dark backdrop
+
+    # ── Animated property ────────────────────────────────────────────────
+    def _get_phase(self) -> float:
+        return self._phase
+
+    def _set_phase(self, val: float):
+        self._phase = val
+        self.repaint()
+
+    anim_phase = pyqtProperty(float, _get_phase, _set_phase)
+
+    def __init__(self):
+        super().__init__()
+        self._phase = 0.0
+        self._build_ui()
+        self._setup_animation()
+
+    # ── Construction ─────────────────────────────────────────────────────
+    def _build_ui(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        _exclude_from_capture(self)
+
+        # Cover the full primary screen
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+
+    # ── Animation ────────────────────────────────────────────────────────
+    def _setup_animation(self):
+        lcm_ms = (self.DOT_CYCLE_MS * self.SHIMMER_MS) // math.gcd(self.DOT_CYCLE_MS, self.SHIMMER_MS)
+
+        self._anim = QPropertyAnimation(self, b"anim_phase", self)
+        self._anim.setDuration(lcm_ms)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(float(lcm_ms))
+        self._anim.setLoopCount(-1)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._phase = 0.0
+        self._anim.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._anim.stop()
+
+    # ── Paint ────────────────────────────────────────────────────────────
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = float(self.width())
+        h = float(self.height())
+
+        ms = self._phase
+        dot_t = (ms % self.DOT_CYCLE_MS) / self.DOT_CYCLE_MS
+        shimmer_t = (ms % self.SHIMMER_MS) / self.SHIMMER_MS
+
+        # ── Dark scrim ──────────────────────────────────────────────
+        p.fillRect(QRectF(0, 0, w, h), self.SCRIM_COLOR)
+
+        # ── Diagonal shimmer band (sweeps top-left → bottom-right) ─
+        # The gradient is perpendicular to the diagonal (top-left → bottom-right).
+        # We slide it along that diagonal so the bright band crosses the screen.
+        diag = math.hypot(w, h)
+        band = self.SHIMMER_WIDTH * diag      # band thickness in px
+        # Progress: -band → diag+band
+        progress = -band + shimmer_t * (diag + 2 * band)
+
+        # Unit vector along the diagonal (top-left → bottom-right)
+        ux, uy = w / diag, h / diag
+        # Centre of the band
+        bcx = ux * progress
+        bcy = uy * progress
+        # Gradient runs perpendicular (in the diagonal direction) across the band
+        x0 = bcx - ux * band * 0.5
+        y0 = bcy - uy * band * 0.5
+        x1 = bcx + ux * band * 0.5
+        y1 = bcy + uy * band * 0.5
+
+        grad = QLinearGradient(x0, y0, x1, y1)
+        grad.setColorAt(0.0, QColor(255, 255, 255, 0))
+        grad.setColorAt(0.25, QColor(255, 255, 255, 18))
+        grad.setColorAt(0.45, QColor(255, 255, 255, 45))
+        grad.setColorAt(0.50, QColor(255, 255, 255, 60))
+        grad.setColorAt(0.55, QColor(255, 255, 255, 45))
+        grad.setColorAt(0.75, QColor(255, 255, 255, 18))
+        grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawRect(QRectF(0, 0, w, h))
+
+        # ── Pulsing dots (centred on screen) ────────────────────────
+        cx = w / 2.0
+        cy = h / 2.0
+        for i in range(3):
+            dot_x = cx + (i - 1) * self.DOT_SPACING
+            dot_phase = (dot_t - i * 0.25) % 1.0
+            t = max(0.0, math.sin(dot_phase * math.pi))
+            alpha = int(80 + 175 * t)
+            scale = 0.6 + 0.4 * t
+
+            # Glow
+            glow_a = int(30 * t)
+            if glow_a > 0:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(255, 255, 255, glow_a)))
+                gr = self.DOT_RADIUS * 2.8 * scale
+                p.drawEllipse(QRectF(dot_x - gr, cy - gr, gr * 2, gr * 2))
+
+            # Body
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(255, 255, 255, alpha)))
+            dr = self.DOT_RADIUS * scale
+            p.drawEllipse(QRectF(dot_x - dr, cy - dr, dr * 2, dr * 2))
+
+        p.end()
+
+
+# ─── Continue / Reset Button (right-edge notch) ──────────────────────────────
+class ContinueButton(QWidget):
+    """
+    Right-edge notch pill with two stacked icon-buttons: ▶ Continue and ↻ Reset.
+    Mirrors the SpotlightBar's notch / bounce / glass design language but
+    anchored to the right edge of the screen.  Collapsed state shows only a
+    thin notch; hovering expands it fully.
+    """
+    continue_pressed = pyqtSignal()
+    reset_pressed    = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._expanded = False
+        self._dragging = False
+        self._drag_offset_y = 0
+        self._build_ui()
+        self._setup_notch()
+
+    # ── UI construction ──────────────────────────────────────────────────
+    def _build_ui(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(CONTINUE_W, CONTINUE_H)
+        _exclude_from_capture(self)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(-2, 0)
+        shadow.setColor(QColor(0, 0, 0, 80))
+        self.setGraphicsEffect(shadow)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 14, 6, 14)
+        layout.setSpacing(10)
+
+        icon_font = QFont("Segoe MDL2 Assets", 16)
+
+        # Continue button (▶ Play icon E768)
+        self._btn_continue = QPushButton("\uE768")
+        self._btn_continue.setFont(icon_font)
+        self._btn_continue.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_continue.setFixedSize(36, 36)
+        self._btn_continue.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,18);
+                color: rgba(255,255,255,210);
+                border: 1px solid rgba(255,255,255,40);
+                border-radius: 18px;
+            }
+            QPushButton:hover {
+                background: rgba(255,255,255,40);
+            }
+            QPushButton:pressed {
+                background: rgba(255,255,255,55);
+            }
+        """)
+        self._btn_continue.setToolTip("Continue to next step")
+        self._btn_continue.clicked.connect(self.continue_pressed.emit)
+
+        # Reset button (↻ Refresh icon E72C)
+        self._btn_reset = QPushButton("\uE72C")
+        self._btn_reset.setFont(icon_font)
+        self._btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_reset.setFixedSize(36, 36)
+        self._btn_reset.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,12);
+                color: rgba(255,255,255,140);
+                border: 1px solid rgba(255,255,255,30);
+                border-radius: 18px;
+            }
+            QPushButton:hover {
+                background: rgba(255,255,255,30);
+                color: rgba(255,255,255,210);
+            }
+            QPushButton:pressed {
+                background: rgba(255,255,255,45);
+            }
+        """)
+        self._btn_reset.setToolTip("Reset session")
+        self._btn_reset.clicked.connect(self.reset_pressed.emit)
+
+        layout.addStretch()
+        layout.addWidget(self._btn_continue, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._btn_reset, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch()
+
+    # ── Notch positioning & animation ────────────────────────────────────
+    def _setup_notch(self):
+        screen = QApplication.primaryScreen().geometry()
+        self._btn_y = (screen.height() - CONTINUE_H) // 2
+        self._expanded_x = screen.width() - CONTINUE_W
+        self._collapsed_x = screen.width() - CONTINUE_PEEK
+        self.move(self._collapsed_x, self._btn_y)
+
+        self._anim = QPropertyAnimation(self, b"pos")
+        self._anim.setDuration(300)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        # Bounce animation (same keyframe pattern as SpotlightBar)
+        self._bounce_anim = QPropertyAnimation(self, b"pos")
+        self._bounce_anim.setDuration(CONTINUE_BOUNCE_MS)
+        self._bounce_anim.setEasingCurve(QEasingCurve.Type.Linear)
+        self._bounce_anim.finished.connect(self._on_bounce_done)
+
+        self._bounce_timer = QTimer(self)
+        self._bounce_timer.setInterval(CONTINUE_BOUNCE_INT)
+        self._bounce_timer.timeout.connect(self._do_bounce)
+        self._bounce_timer.start()
+
+    def _expand(self):
+        if self._expanded:
+            return
+        self._expanded = True
+        self._bounce_anim.stop()
+        self._anim.stop()
+        self._anim.setStartValue(self.pos())
+        self._anim.setEndValue(QPoint(self._expanded_x, self._btn_y))
+        self._anim.start()
+
+    def _collapse(self):
+        if not self._expanded:
+            return
+        self._expanded = False
+        self._bounce_anim.stop()
+        self._anim.stop()
+        self._anim.setStartValue(self.pos())
+        self._anim.setEndValue(QPoint(self._collapsed_x, self._btn_y))
+        self._anim.start()
+
+    # ── Periodic bounce ──────────────────────────────────────────────────
+    def _do_bounce(self):
+        if self._expanded:
+            return
+        if self._anim.state() == QPropertyAnimation.State.Running:
+            return
+
+        rest = QPoint(self._collapsed_x, self._btn_y)
+        cx = self._collapsed_x
+        by = self._btn_y
+        pk = CONTINUE_BOUNCE_PX
+
+        self._bounce_anim.stop()
+        self._bounce_anim.setStartValue(rest)
+        self._bounce_anim.setEndValue(rest)
+
+        # Keyframes: pop left → return → smaller pop → return → settle
+        self._bounce_anim.setKeyValueAt(0.00, QPoint(cx, by))
+        self._bounce_anim.setKeyValueAt(0.15, QPoint(cx - pk, by))
+        self._bounce_anim.setKeyValueAt(0.35, QPoint(cx, by))
+        self._bounce_anim.setKeyValueAt(0.50, QPoint(cx - int(pk * 0.45), by))
+        self._bounce_anim.setKeyValueAt(0.65, QPoint(cx, by))
+        self._bounce_anim.setKeyValueAt(0.78, QPoint(cx - int(pk * 0.18), by))
+        self._bounce_anim.setKeyValueAt(0.88, QPoint(cx, by))
+        self._bounce_anim.setKeyValueAt(1.00, QPoint(cx, by))
+        self._bounce_anim.start()
+
+    def _on_bounce_done(self):
+        if not self._expanded:
+            self.move(self._collapsed_x, self._btn_y)
+
+    # ── Hover events ─────────────────────────────────────────────────────
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        if not self._dragging:
+            self._expand()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if not self._dragging:
+            self._collapse()
+
+    # ── Drag (vertical only, along right edge) ──────────────────────────
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_offset_y = event.position().y()
+            # Stop animations so they don't fight the drag
+            self._anim.stop()
+            self._bounce_anim.stop()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            screen_h = QApplication.primaryScreen().geometry().height()
+            global_y = self.mapToGlobal(event.position().toPoint()).y()
+            new_y = int(global_y - self._drag_offset_y)
+            # Clamp to screen bounds
+            new_y = max(0, min(new_y, screen_h - CONTINUE_H))
+            self._btn_y = new_y
+            cur_x = self._expanded_x if self._expanded else self._collapsed_x
+            self.move(cur_x, new_y)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            # If mouse is no longer over the widget, collapse
+            if not self.underMouse():
+                self._collapse()
+        super().mouseReleaseEvent(event)
+
+    # ── Paint: notch shape (flat right, rounded left) ────────────────────
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = float(self.width()), float(self.height())
+        r = w / 2.0  # pill radius for left corners
+
+        # Notch shape: flat right edge, rounded left corners
+        path = QPainterPath()
+        path.moveTo(w, 0)
+        path.lineTo(r, 0)
+        path.quadTo(0, 0, 0, r)
+        path.lineTo(0, h - r)
+        path.quadTo(0, h, r, h)
+        path.lineTo(w, h)
+        path.closeSubpath()
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(SPOT_GLASS_BASE))
+        painter.drawPath(path)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(SPOT_GLASS_BORDER, 1.0))
+        painter.drawPath(path)
+        painter.end()
+
+
+# ─── Action Bridge ────────────────────────────────────────────────────────────
+class _ActionBridge(QObject):
+    """
+    Thin QObject used to relay background mouse/keyboard events
+    safely into the Qt main thread via queued signals.
+    """
+    action_detected = pyqtSignal()   # any click / keypress while highlight shown
 
 
 # ─── Top-Level Application Controller ────────────────────────────────────────
 class HaloApp(QObject):
     """
-    Owns and wires OverlayWindow + SpotlightBar + ResponseCard + AIWorker.
+    Owns and wires OverlayWindow + SpotlightBar + ResponseCard + ContinueButton
+    + AIWorker.
 
     Inherits QObject so that signal connections from AIWorker (a QThread) are
     automatically queued onto the main thread — required for safe GUI updates.
 
-    Session flow (per SSOT §3):
-      1. User types a prompt and presses Enter (or Alt+N) → first step.
-      2. User acts on the highlighted element, then presses Alt+N → next step
-         (no new prompt; Session memory carries context forward).
-      3. Alt+R resets the session and clears the highlight.
+    Session flow:
+      1. User types a prompt and presses Enter → first step.
+      2. User acts on the highlighted element, then clicks the ▶ Continue
+         button → next step (Session memory carries context forward).
+      3. Clicking the ↻ Reset button clears the session.
 
     self.chat is an alias for self.card (ResponseCard) for backward-compat.
     Lifecycle: instantiate, then call .start().
@@ -1061,23 +1445,29 @@ class HaloApp(QObject):
 
     def __init__(self):
         super().__init__()
-        self.overlay = OverlayWindow()
-        self.bar     = SpotlightBar()     # self-positions at top-centre
-        self.card    = ResponseCard()     # self-positions at right edge
-        self.chat    = self.card           # backward-compat alias
+        self.overlay  = OverlayWindow()
+        self.bar      = SpotlightBar()      # self-positions at top-centre
+        self.card     = ResponseCard()      # self-positions at right edge
+        self.loader   = LoadingIndicator()  # pulsing-dots pill below the bar
+        self.cont_btn = ContinueButton()    # right-edge ▶/↻ pill
+        self.chat     = self.card            # backward-compat alias
         self._worker: AIWorker | None = None
 
-        # Tell overlay not to dim over the bar and card
-        self.overlay._exclude_widgets = [self.bar, self.card]
+        # Tell overlay not to dim over the bar, card, loader, and continue button
+        self.overlay._exclude_widgets = [self.bar, self.card, self.loader, self.cont_btn]
 
         # Session state
         self._session         = Session()
         self._session_started = False     # True after the first step is fired
+        self._highlight_active = False    # True while AI highlight is shown
 
-        # Hotkey bridge (routes keyboard thread → Qt main thread)
-        self._bridge = _HotkeyBridge()
-        self._bridge.send_pressed.connect(self._hotkey_send)
-        self._bridge.reset_pressed.connect(self._hotkey_reset)
+        # Action bridge (routes background mouse/key events → Qt main thread)
+        self._bridge = _ActionBridge()
+        self._bridge.action_detected.connect(self._on_user_action)
+
+        # Continue / Reset button signals
+        self.cont_btn.continue_pressed.connect(self._continue_session)
+        self.cont_btn.reset_pressed.connect(self._reset_session)
 
         # TTS state
         self._tts_worker: TTSWorker | None = None
@@ -1088,21 +1478,79 @@ class HaloApp(QObject):
         self.overlay.show()
         self.bar.show()
         self.card.show()
-        # Ensure bar & card render above the dim overlay
+        self.cont_btn.show()
+        # Ensure widgets render above the dim overlay
         self.bar.raise_()
         self.card.raise_()
+        self.cont_btn.raise_()
         self.card.append_message(
             "Halo",
             "Hello! I'm here to help you navigate. What do you need?\n\n"
-            "Tip: press Alt+N after each action to continue.",
+            "Tip: after acting on a highlight, click the \u25b6 button on the right edge to continue.",
         )
 
-        # Register global hotkeys (silently skipped in headless/non-admin envs)
-        try:
-            keyboard.add_hotkey("alt+n", self._bridge.send_pressed.emit, suppress=True)
-            keyboard.add_hotkey("alt+r", self._bridge.reset_pressed.emit, suppress=True)
-        except Exception:
-            pass
+        # Register global action detection (keyboard/mouse)
+        if keyboard:
+            try:
+                keyboard.on_press(self._on_any_key)
+            except Exception:
+                pass
+        if mouse:
+            try:
+                mouse.on_button(self._on_mouse_action, types=("down",))
+            except Exception:
+                pass
+
+    # ── Action detection ─────────────────────────────────────────────────────
+    def _on_any_key(self, event):
+        """keyboard.on_press callback — runs on bg thread, emits signal."""
+        # Ignore bare modifier keys (Shift, Ctrl, Alt, Win)
+        if event.name in ("shift", "ctrl", "alt", "left alt", "right alt",
+                          "left shift", "right shift", "left ctrl", "right ctrl",
+                          "left windows", "right windows"):
+            return
+        self._bridge.action_detected.emit()
+
+    def _on_mouse_action(self):
+        """mouse.on_button callback — runs on bg thread, emits signal."""
+        self._bridge.action_detected.emit()
+
+    def _on_user_action(self):
+        """Any click or keypress while the highlight is active."""
+        if not self._highlight_active:
+            return
+        self._highlight_active = False
+        self.overlay.clear_highlight()
+        self.bar.set_status("Click \u25b6 to continue")
+        self.card.set_status("Click \u25b6 to continue")
+
+    # ── Continue / Reset (button driven) ──────────────────────────────────
+    def _continue_session(self):
+        """\u25b6 button — advance the session (or start it using the bar's text)."""
+        if self._worker and self._worker.isRunning():
+            return
+
+        if not self._session_started:
+            text = self.bar.input_box.text().strip()
+            if text:
+                self.bar._on_send()
+            return
+
+        self.bar.set_status("Thinking\u2026")
+        self.card.set_status("Thinking\u2026")
+        self._capture_screenshot()
+        self._run_worker(SCREENSHOT_PATH, None)
+
+    def _reset_session(self):
+        """\u21bb button — discard the current session and clear all highlights."""
+        self._session         = Session()
+        self._session_started = False
+        self._highlight_active = False
+        self.loader.hide()
+        self.overlay.clear_highlight()
+        self.bar.set_status("Ready")
+        self.card.set_status("Ready")
+        self.card.append_message("Halo", "Session reset. What would you like to do?")
 
     # ── Private ──────────────────────────────────────────────────────────────
     def _on_user_prompt(self, prompt: str):
@@ -1110,38 +1558,12 @@ class HaloApp(QObject):
         self._session_started = True
         self._run_worker(SCREENSHOT_PATH, prompt)
 
-    def _hotkey_send(self):
-        """Alt+N — advance the session (or start it using the bar's text)."""
-        if self._worker and self._worker.isRunning():
-            return   # still processing previous step
-
-        if not self._session_started:
-            # Grab whatever text is in the input bar and submit it
-            text = self.bar.input_box.text().strip()
-            if text:
-                self.bar._on_send()  # triggers _on_user_prompt via signal
-            return
-
-        # Auto-continue: no new prompt — Session memory provides context
-        self.bar.set_status("Thinking…")
-        self.card.set_status("Thinking…")
-        self._capture_screenshot()
-        self._run_worker(SCREENSHOT_PATH, None)
-
-    def _hotkey_reset(self):
-        """Alt+R — discard the current session and clear all highlights."""
-        self._stop_tts()              # stop any voice playback
-        self._session         = Session()
-        self._session_started = False
-        self.overlay.clear_highlight()
-        self.bar.set_status("Ready")
-        self.card.set_status("Ready")
-        self.card.append_message("Halo", "Session reset. What would you like to do?")
-
     def _run_worker(self, screenshot_path: str, prompt: str | None):
         """Spin up an AIWorker for one pipeline step."""
         self._stop_tts()              # interrupt voice if still speaking
         self._capture_screenshot()
+        self.loader.show()
+        self.loader.raise_()
         self._worker = AIWorker(screenshot_path, prompt, session=self._session)
         self._worker.result_ready.connect(self._on_result)
         self._worker.error.connect(self._on_error)
@@ -1153,6 +1575,7 @@ class HaloApp(QObject):
             sct.shot(mon=1, output=SCREENSHOT_PATH)
 
     def _on_result(self, result: dict):
+        self.loader.hide()
         import threading
         print(f"[HALO] _on_result called on thread={threading.current_thread().name}  "
               f"status={result.get('status')}  coords=({result.get('x')},{result.get('y')},"
@@ -1162,9 +1585,10 @@ class HaloApp(QObject):
                 result["x"], result["y"],
                 result["width"], result["height"],
             )
+            self._highlight_active = True
             self.card.append_message("Halo", result["message"])
-            self.bar.set_status("Press Alt+N after acting")
-            self.card.set_status("Press Alt+N after acting")
+            self.bar.set_status("Act on the highlighted element")
+            self.card.set_status("Act on the highlighted element")
             # Read the response aloud via ElevenLabs TTS
             self._speak(result["message"])
         else:
@@ -1174,6 +1598,7 @@ class HaloApp(QObject):
             self.card.set_status("Ready")
 
     def _on_error(self, error_msg: str):
+        self.loader.hide()
         self.card.append_message("Halo", f"[Error] {error_msg}", "rgba(255,69,58,0.75)")
         self.bar.set_status("Ready")
         self.card.set_status("Ready")
