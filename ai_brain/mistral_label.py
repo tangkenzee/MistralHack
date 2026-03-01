@@ -64,8 +64,6 @@ if _provider_override == "gemini" and GOOGLE_API_KEY:
 else:
     AI_PROVIDER = "mistral"
 
-print(f"[BRAIN] AI provider: {AI_PROVIDER}")
-
 # ── Model Configuration ──────────────────────────────────────────────────────
 MISTRAL_MODEL_CONFIG = {
     "model": "mistral-small-latest",
