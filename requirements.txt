@@ -9,6 +9,7 @@ mistralai[realtime]
 python-dotenv
 keyboard
 pyaudio
+mouse
 
 # Testing
 pytest>=8.0.0
