@@ -869,6 +869,12 @@ class ResponseCard(QWidget):
 
         self.history = QTextEdit()
         self.history.setReadOnly(True)
+        self.history.setFrameShape(QTextEdit.Shape.NoFrame)
+        self.history.setLineWidth(0)
+        self.history.viewport().setAutoFillBackground(False)
+        self.history.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.history.setFont(QFont(FONT_FAMILY, 11))
         self.history.setStyleSheet("""
             QTextEdit {
