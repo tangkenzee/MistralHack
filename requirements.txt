@@ -5,8 +5,10 @@ opencv-python
 numpy
 mistralai
 google-genai
+mistralai[realtime]
 python-dotenv
 keyboard
+pyaudio
 
 # Testing
 pytest>=8.0.0

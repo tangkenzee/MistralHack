@@ -25,6 +25,7 @@ import signal
 import os
 import ctypes
 import random
+import asyncio
 from pathlib import Path
 import mss
 try:
@@ -47,6 +48,7 @@ from PyQt6.QtWidgets import (
 
 import ai_brain
 from ai_brain import Session
+from ai_brain.speech_to_text import realtime_transcribe
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 _ROOT      = Path(__file__).parent
@@ -153,6 +155,59 @@ class AIWorker(QThread):
             self.result_ready.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+# ─── STT Worker Thread ───────────────────────────────────────────────────────
+class RealtimeSTTWorker(QThread):
+    """
+    Runs the Voxtral realtime transcription in a background thread.
+    Streams microphone audio → Voxtral and emits text deltas as they
+    arrive so the overlay can display live captions.
+
+    Signals:
+        text_delta(str)  – incremental text fragment from the model
+        done()           – transcription stream finished cleanly
+        error(str)       – something went wrong
+    """
+    text_delta = pyqtSignal(str)
+    done       = pyqtSignal()
+    error      = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._stop_event: asyncio.Event | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def run(self):
+        """Entry point for the QThread — spins up an asyncio event loop."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._stop_event = asyncio.Event()
+
+        self._loop.run_until_complete(
+            realtime_transcribe(
+                stop_event=self._stop_event,
+                on_delta=self._emit_delta,
+                on_done=self._emit_done,
+                on_error=self._emit_error,
+            )
+        )
+        self._loop.close()
+
+    # ── Thread-safe signal wrappers (called from the asyncio loop) ──
+    def _emit_delta(self, text: str):
+        self.text_delta.emit(text)
+
+    def _emit_done(self):
+        self.done.emit()
+
+    def _emit_error(self, msg: str):
+        self.error.emit(msg)
+
+    def request_stop(self):
+        """Ask the microphone iterator to finish (called from the main thread)."""
+        if self._stop_event is not None and self._loop is not None:
+            self._loop.call_soon_threadsafe(self._stop_event.set)
 
 
 # ─── Full-Screen Overlay (paint-only, click-through) ─────────────────────────
@@ -365,6 +420,100 @@ class GlassButton(QPushButton):
 
 
 # ─── Notch Input Bar ──────────────────────────────────────────────────────────
+class MicButton(QPushButton):
+    """
+    A small circular microphone toggle button that glows red when recording.
+    Uses Segoe MDL2 Assets glyph \uE720 (Microphone).
+    """
+
+    def _get_hover(self) -> float:
+        return self._hover
+
+    def _set_hover(self, val: float):
+        self._hover = val
+        self.update()
+
+    hover_progress = pyqtProperty(float, _get_hover, _set_hover)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hover = 0.0
+        self._recording = False
+        self._anim = QPropertyAnimation(self, b"hover_progress", self)
+        self._anim.setDuration(180)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFlat(True)
+        self.setFixedSize(30, 30)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def set_recording(self, recording: bool):
+        self._recording = recording
+        self.update()
+
+    def event(self, e):
+        t = e.type()
+        if t == QEvent.Type.HoverEnter:
+            self._anim.stop()
+            self._anim.setStartValue(self._hover)
+            self._anim.setEndValue(1.0)
+            self._anim.start()
+        elif t == QEvent.Type.HoverLeave:
+            self._anim.stop()
+            self._anim.setStartValue(self._hover)
+            self._anim.setEndValue(0.0)
+            self._anim.start()
+        return super().event(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        r = min(w, h) / 2.0
+        rect = QRectF(0.5, 0.5, w - 1.0, h - 1.0)
+        t = self._hover
+        scale = 0.85 if self.isDown() else 1.0
+
+        if self._recording:
+            # Glowing red circle when recording
+            fill_a = int((80 + t * 60) * scale)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(255, 60, 50, fill_a)))
+            p.drawEllipse(rect)
+
+            # Red rim
+            rim_a = int((180 + t * 75) * scale)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(255, 60, 50, rim_a), 1.4))
+            p.drawEllipse(rect)
+
+            # White mic icon
+            icon_a = int(255 * scale)
+            p.setPen(QPen(QColor(255, 255, 255, icon_a)))
+        else:
+            # Subtle frosted circle at rest
+            fill_a = int((8 + t * 30) * scale)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(255, 255, 255, fill_a)))
+            p.drawEllipse(rect)
+
+            # Rim
+            rim_a = int((60 + t * 140) * scale)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(255, 255, 255, rim_a), 1.0))
+            p.drawEllipse(rect)
+
+            # Muted mic icon
+            icon_a = int((120 + t * 100) * scale)
+            p.setPen(QPen(QColor(255, 255, 255, icon_a)))
+
+        # Draw mic glyph (Segoe MDL2 Assets: \uE720)
+        p.setFont(QFont("Segoe MDL2 Assets", 12))
+        p.drawText(rect.toRect(), Qt.AlignmentFlag.AlignCenter, "\uE720")
+        p.end()
+
+
 class SpotlightBar(QWidget):
     """
     iPhone-notch-style input bar fused to the top-centre of the screen.
@@ -379,6 +528,8 @@ class SpotlightBar(QWidget):
         super().__init__()
         self._expanded = False
         self.status_label = QLabel("Ready")
+        self._stt_worker: RealtimeSTTWorker | None = None
+        self._live_text = ""             # accumulated realtime transcription
         self._build_ui()
         self._setup_notch()
 
@@ -429,8 +580,14 @@ class SpotlightBar(QWidget):
         self.input_box.returnPressed.connect(self._on_send)
         self.input_box.installEventFilter(self)   # track focus-out
 
+        # Microphone toggle button
+        self.mic_btn = MicButton(self)
+        self.mic_btn.setToolTip("Hold to speak")
+        self.mic_btn.clicked.connect(self._on_mic_toggle)
+
         layout.addWidget(search_icon)
         layout.addWidget(self.input_box, stretch=1)
+        layout.addWidget(self.mic_btn)
 
     # ── Notch positioning & animation ────────────────────────────────────
     def _setup_notch(self):
@@ -554,6 +711,52 @@ class SpotlightBar(QWidget):
         painter.setPen(QPen(SPOT_GLASS_BORDER, 1.0))
         painter.drawPath(path)
         painter.end()
+
+    # ── Microphone toggle ──────────────────────────────────────────────────
+    def _on_mic_toggle(self):
+        """Toggle between recording and idle states."""
+        if self._stt_worker is not None and self._stt_worker.isRunning():
+            # ── Stop recording → finalise ──
+            self.mic_btn.set_recording(False)
+            self._stt_worker.request_stop()
+            # The `done` signal will fire _on_stt_done which auto-submits.
+        else:
+            # ── Start recording ──
+            self._expand()
+            self.input_box.clear()
+            self._live_text = ""
+            self.input_box.setPlaceholderText("Listening\u2026")
+            self.mic_btn.set_recording(True)
+
+            self._stt_worker = RealtimeSTTWorker()
+            self._stt_worker.text_delta.connect(self._on_stt_delta)
+            self._stt_worker.done.connect(self._on_stt_done)
+            self._stt_worker.error.connect(self._on_stt_error)
+            self._stt_worker.start()
+
+    def _on_stt_delta(self, text: str):
+        """Called for each incremental text fragment from Voxtral Realtime."""
+        self._live_text += text
+        self.input_box.setText(self._live_text)
+
+    def _on_stt_done(self):
+        """Called when the realtime transcription stream finishes."""
+        self.mic_btn.set_recording(False)
+        final = self._live_text.strip()
+        if final:
+            self.input_box.setText(final)
+            self._on_send()                    # auto-submit the transcribed text
+        else:
+            self.input_box.clear()
+            self.input_box.setPlaceholderText("Could not hear you \u2014 try again")
+
+    def _on_stt_error(self, error_msg: str):
+        """Handle transcription failure."""
+        self.mic_btn.set_recording(False)
+        self.input_box.setEnabled(True)
+        self.input_box.clear()
+        self.input_box.setPlaceholderText("Mic error \u2014 try again")
+        print(f"  \u274c STT Error: {error_msg}")
 
     # ── Status / send ────────────────────────────────────────────────────
     def set_status(self, msg: str):
