@@ -38,7 +38,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QPen, QFont, QScreen, QIcon,
-    QBrush, QPainterPath, QPalette, QCursor,
+    QBrush, QPainterPath, QPalette, QCursor, QLinearGradient,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -998,6 +998,145 @@ class ResponseCard(QWidget):
 ChatPanel = ResponseCard
 
 
+# ─── Loading Indicator ────────────────────────────────────────────────────────
+class LoadingIndicator(QWidget):
+    """
+    Full-screen loading overlay with a dark scrim, a horizontal shimmer
+    band that sweeps across the entire screen, and three pulsing dots in
+    a centred glass pill.  Shown while the AI worker is processing.
+    Uses QPropertyAnimation so translucent-window repaints stay alive.
+    """
+
+    DOT_RADIUS     = 5.0
+    DOT_SPACING    = 22.0
+    DOT_CYCLE_MS   = 1400
+    SHIMMER_MS     = 2200      # slower sweep across full screen
+    SHIMMER_WIDTH  = 0.35      # shimmer band width as fraction of diagonal
+    SCRIM_COLOR    = QColor(0, 0, 0, 140)   # semi-dark backdrop
+
+    # ── Animated property ────────────────────────────────────────────────
+    def _get_phase(self) -> float:
+        return self._phase
+
+    def _set_phase(self, val: float):
+        self._phase = val
+        self.repaint()
+
+    anim_phase = pyqtProperty(float, _get_phase, _set_phase)
+
+    def __init__(self):
+        super().__init__()
+        self._phase = 0.0
+        self._build_ui()
+        self._setup_animation()
+
+    # ── Construction ─────────────────────────────────────────────────────
+    def _build_ui(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        _exclude_from_capture(self)
+
+        # Cover the full primary screen
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+
+    # ── Animation ────────────────────────────────────────────────────────
+    def _setup_animation(self):
+        lcm_ms = (self.DOT_CYCLE_MS * self.SHIMMER_MS) // math.gcd(self.DOT_CYCLE_MS, self.SHIMMER_MS)
+
+        self._anim = QPropertyAnimation(self, b"anim_phase", self)
+        self._anim.setDuration(lcm_ms)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(float(lcm_ms))
+        self._anim.setLoopCount(-1)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._phase = 0.0
+        self._anim.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._anim.stop()
+
+    # ── Paint ────────────────────────────────────────────────────────────
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = float(self.width())
+        h = float(self.height())
+
+        ms = self._phase
+        dot_t = (ms % self.DOT_CYCLE_MS) / self.DOT_CYCLE_MS
+        shimmer_t = (ms % self.SHIMMER_MS) / self.SHIMMER_MS
+
+        # ── Dark scrim ──────────────────────────────────────────────
+        p.fillRect(QRectF(0, 0, w, h), self.SCRIM_COLOR)
+
+        # ── Diagonal shimmer band (sweeps top-left → bottom-right) ─
+        # The gradient is perpendicular to the diagonal (top-left → bottom-right).
+        # We slide it along that diagonal so the bright band crosses the screen.
+        diag = math.hypot(w, h)
+        band = self.SHIMMER_WIDTH * diag      # band thickness in px
+        # Progress: -band → diag+band
+        progress = -band + shimmer_t * (diag + 2 * band)
+
+        # Unit vector along the diagonal (top-left → bottom-right)
+        ux, uy = w / diag, h / diag
+        # Centre of the band
+        bcx = ux * progress
+        bcy = uy * progress
+        # Gradient runs perpendicular (in the diagonal direction) across the band
+        x0 = bcx - ux * band * 0.5
+        y0 = bcy - uy * band * 0.5
+        x1 = bcx + ux * band * 0.5
+        y1 = bcy + uy * band * 0.5
+
+        grad = QLinearGradient(x0, y0, x1, y1)
+        grad.setColorAt(0.0, QColor(255, 255, 255, 0))
+        grad.setColorAt(0.25, QColor(255, 255, 255, 18))
+        grad.setColorAt(0.45, QColor(255, 255, 255, 45))
+        grad.setColorAt(0.50, QColor(255, 255, 255, 60))
+        grad.setColorAt(0.55, QColor(255, 255, 255, 45))
+        grad.setColorAt(0.75, QColor(255, 255, 255, 18))
+        grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawRect(QRectF(0, 0, w, h))
+
+        # ── Pulsing dots (centred on screen) ────────────────────────
+        cx = w / 2.0
+        cy = h / 2.0
+        for i in range(3):
+            dot_x = cx + (i - 1) * self.DOT_SPACING
+            dot_phase = (dot_t - i * 0.25) % 1.0
+            t = max(0.0, math.sin(dot_phase * math.pi))
+            alpha = int(80 + 175 * t)
+            scale = 0.6 + 0.4 * t
+
+            # Glow
+            glow_a = int(30 * t)
+            if glow_a > 0:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(255, 255, 255, glow_a)))
+                gr = self.DOT_RADIUS * 2.8 * scale
+                p.drawEllipse(QRectF(dot_x - gr, cy - gr, gr * 2, gr * 2))
+
+            # Body
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(255, 255, 255, alpha)))
+            dr = self.DOT_RADIUS * scale
+            p.drawEllipse(QRectF(dot_x - dr, cy - dr, dr * 2, dr * 2))
+
+        p.end()
+
+
 # ─── Hotkey Bridge ────────────────────────────────────────────────────────────
 class _HotkeyBridge(QObject):
     """
@@ -1031,11 +1170,12 @@ class HaloApp(QObject):
         self.overlay = OverlayWindow()
         self.bar     = SpotlightBar()     # self-positions at top-centre
         self.card    = ResponseCard()     # self-positions at right edge
+        self.loader  = LoadingIndicator() # pulsing-dots pill below the bar
         self.chat    = self.card           # backward-compat alias
         self._worker: AIWorker | None = None
 
-        # Tell overlay not to dim over the bar and card
-        self.overlay._exclude_widgets = [self.bar, self.card]
+        # Tell overlay not to dim over the bar, card, and loader
+        self.overlay._exclude_widgets = [self.bar, self.card, self.loader]
 
         # Session state
         self._session         = Session()
@@ -1096,6 +1236,7 @@ class HaloApp(QObject):
         """Alt+R — discard the current session and clear all highlights."""
         self._session         = Session()
         self._session_started = False
+        self.loader.hide()
         self.overlay.clear_highlight()
         self.bar.set_status("Ready")
         self.card.set_status("Ready")
@@ -1104,6 +1245,8 @@ class HaloApp(QObject):
     def _run_worker(self, screenshot_path: str, prompt: str | None):
         """Spin up an AIWorker for one pipeline step."""
         self._capture_screenshot()
+        self.loader.show()
+        self.loader.raise_()
         self._worker = AIWorker(screenshot_path, prompt, session=self._session)
         self._worker.result_ready.connect(self._on_result)
         self._worker.error.connect(self._on_error)
@@ -1115,6 +1258,7 @@ class HaloApp(QObject):
             sct.shot(mon=1, output=SCREENSHOT_PATH)
 
     def _on_result(self, result: dict):
+        self.loader.hide()
         import threading
         print(f"[HALO] _on_result called on thread={threading.current_thread().name}  "
               f"status={result.get('status')}  coords=({result.get('x')},{result.get('y')},"
@@ -1134,6 +1278,7 @@ class HaloApp(QObject):
             self.card.set_status("Ready")
 
     def _on_error(self, error_msg: str):
+        self.loader.hide()
         self.card.append_message("Halo", f"[Error] {error_msg}", "rgba(255,69,58,0.75)")
         self.bar.set_status("Ready")
         self.card.set_status("Ready")
